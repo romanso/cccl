@@ -4,21 +4,63 @@
 #include <stddef.h>
 #ifdef __cplusplus
 extern "C" {
-inline void* memcpy(void* __s1, const void* __s2, size_t __n)
+// REQ-9: clang may lower large copies/zero-fills to out-of-line memcpy/memset/
+// memmove/memcmp libcalls. Those are libc functions, not compiler-rt builtins,
+// so in the freestanding standalone environment the produced library must
+// define them itself. Provide strong out-of-line byte-loop implementations.
+// __attribute__((no_builtin)) stops clang's loop-idiom pass from rewriting the
+// loops back into the very libcall they implement (which would recurse).
+__attribute__((used, no_builtin)) inline void* memcpy(void* __s1, const void* __s2, size_t __n)
 {
-  return __builtin_memcpy(__s1, __s2, __n);
+  unsigned char* __d       = (unsigned char*) __s1;
+  const unsigned char* __s = (const unsigned char*) __s2;
+  for (size_t __i = 0; __i < __n; ++__i)
+  {
+    __d[__i] = __s[__i];
+  }
+  return __s1;
 }
-inline void* memset(void* __s, int __c, size_t __n)
+__attribute__((used, no_builtin)) inline void* memset(void* __s, int __c, size_t __n)
 {
-  return __builtin_memset(__s, __c, __n);
+  unsigned char* __d = (unsigned char*) __s;
+  for (size_t __i = 0; __i < __n; ++__i)
+  {
+    __d[__i] = (unsigned char) __c;
+  }
+  return __s;
 }
-inline void* memmove(void* __s1, const void* __s2, size_t __n)
+__attribute__((used, no_builtin)) inline void* memmove(void* __s1, const void* __s2, size_t __n)
 {
-  return __builtin_memmove(__s1, __s2, __n);
+  unsigned char* __d       = (unsigned char*) __s1;
+  const unsigned char* __s = (const unsigned char*) __s2;
+  if (__d < __s)
+  {
+    for (size_t __i = 0; __i < __n; ++__i)
+    {
+      __d[__i] = __s[__i];
+    }
+  }
+  else if (__d > __s)
+  {
+    for (size_t __i = __n; __i > 0; --__i)
+    {
+      __d[__i - 1] = __s[__i - 1];
+    }
+  }
+  return __s1;
 }
-inline int memcmp(const void* __s1, const void* __s2, size_t __n)
+__attribute__((used, no_builtin)) inline int memcmp(const void* __s1, const void* __s2, size_t __n)
 {
-  return __builtin_memcmp(__s1, __s2, __n);
+  const unsigned char* __a = (const unsigned char*) __s1;
+  const unsigned char* __b = (const unsigned char*) __s2;
+  for (size_t __i = 0; __i < __n; ++__i)
+  {
+    if (__a[__i] != __b[__i])
+    {
+      return (int) __a[__i] - (int) __b[__i];
+    }
+  }
+  return 0;
 }
 inline char* strchr(char* __s, int __c)
 {

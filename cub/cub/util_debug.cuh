@@ -152,11 +152,18 @@ Debug(cudaError_t error, [[maybe_unused]] const char* filename, [[maybe_unused]]
  * \brief Debug macro with exit
  */
 #ifndef CubDebugExit
-#  define CubDebugExit(e)                                               \
+#  if _CCCL_HOSTJIT()
+// Standalone host-JIT has no libc: do not call exit(). Still report the error
+// via Debug(); the caller observes the returned cudaError_t. Mirrors the
+// _CCCL_HOSTJIT() handling of _CubLog below.
+#    define CubDebugExit(e) ((void) CUB_NS_QUALIFIER::Debug((cudaError_t) (e), __FILE__, __LINE__))
+#  else
+#    define CubDebugExit(e)                                             \
     if (CUB_NS_QUALIFIER::Debug((cudaError_t) (e), __FILE__, __LINE__)) \
     {                                                                   \
       exit(1);                                                          \
     }
+#  endif
 #endif
 
 /**

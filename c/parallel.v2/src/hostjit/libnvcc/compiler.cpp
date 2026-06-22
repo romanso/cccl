@@ -1540,6 +1540,11 @@ public:
     arg_strings.push_back("-fskip-odr-check-in-gmf");
     arg_strings.push_back("-O" + std::to_string(config.optimization_level));
     arg_strings.push_back("-std=c++17");
+    // REQ-9: the kernel-launch stub uses function-local statics with dynamic
+    // initialization, which otherwise emit __cxa_guard_acquire/release
+    // (libcxxabi/libsupc++) externals. Disable the thread-safe-once guard so
+    // the produced library leaves no non-CUDART references.
+    arg_strings.push_back("-fno-threadsafe-statics");
 
     if (config.trace_includes)
     {
@@ -2191,11 +2196,10 @@ public:
     arg_strings.push_back("--eh-frame-hdr");
     arg_strings.push_back("-m");
     arg_strings.push_back("elf_x86_64");
-    // Allow unresolved symbols — they will be satisfied at dlopen() time
-    // by libraries already loaded in the host process (libc, libstdc++,
-    // cudart, etc.).  This removes the need for system CRT objects and
-    // dev packages on the target machine.
-    arg_strings.push_back("--allow-shlib-undefined");
+    // REQ-9: the produced library must not leave external references other
+    // than CUDART. Link strictly so any unresolved symbol fails at link time
+    // instead of surfacing as a load-time error on the user's machine.
+    arg_strings.push_back("--no-undefined");
     arg_strings.push_back("-o");
     arg_strings.push_back(output_path);
 

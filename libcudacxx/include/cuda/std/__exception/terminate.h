@@ -39,7 +39,10 @@ _CCCL_BEGIN_NAMESPACE_CUDA_STD_NOVERSION // purposefully not using versioning na
 
 [[noreturn]] _CCCL_API inline void __cccl_terminate() noexcept
 {
-#if _CCCL_TILE_COMPILATION()
+#if _CCCL_HOSTJIT()
+  // Standalone host-JIT has no libc exit(); trap instead (noreturn, no libc).
+  NV_IF_ELSE_TARGET(NV_IS_HOST, (__builtin_trap();), (::__trap();))
+#elif _CCCL_TILE_COMPILATION()
   NV_IF_ELSE_TARGET(NV_IS_HOST, (::exit(-1);), (assert(false);))
 #else // ^^^ _CCCL_TILE_COMPILATION() ^^^ / vvv !_CCCL_TILE_COMPILATION()
   NV_IF_ELSE_TARGET(NV_IS_HOST, (::exit(-1);), (::__trap();))
