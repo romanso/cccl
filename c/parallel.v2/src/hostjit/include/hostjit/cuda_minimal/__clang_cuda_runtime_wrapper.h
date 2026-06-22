@@ -417,21 +417,59 @@ extern "C" unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, siz
 #  endif
 
 // The JIT shared library is linked without the C runtime (no libc on the link
-// line) so atexit is unavailable.  The CUDA module constructor calls atexit()
-// to register a cleanup function.  Provide a no-op stub — the JIT library is
-// short-lived and unloaded explicitly.
+// line) so libc atexit is unavailable.  Clang's CUDA fatbin embedding
+// (-fcuda-include-gpubinary) emits a module constructor that registers the
+// fatbin and then calls atexit(__cuda_module_dtor) to schedule
+// __cudaUnregisterFatBinary at teardown.
+//
+// CFE-104: the previous no-op atexit stub dropped that callback entirely, so
+// __cudaUnregisterFatBinary was never called -- every JIT-built module leaked
+// its fatbin registration (the CUDA runtime keeps a dangling entry; this is
+// why the loader currently refuses to dlclose, see loader.cpp / #9367).
+//
+// Instead, capture the callback(s) clang hands to atexit at load time and run
+// them from an ELF .fini_array destructor on library unload (no libc atexit
+// needed).  This makes the module unregister its fatbin on dlclose, which in
+// turn makes dlclose safe again.
 #  if !defined(__HOSTJIT_DEVICE_COMPILATION__)
+namespace {
+// Capacity matches the C standard's ATEXIT_MAX minimum (>= 32). A fixed array
+// is used because the freestanding environment has no allocator to grow the
+// list dynamically the way a hosted libc does.
+inline constexpr int __hostjit_atexit_max    = 32;
+inline void (*__hostjit_atexit_cbs[__hostjit_atexit_max])(void) = {};
+inline int __hostjit_atexit_n                = 0;
+} // namespace
+
 #    if defined(_MSC_VER)
-extern "C" int atexit(void(__cdecl*)(void))
+extern "C" int atexit(void(__cdecl* __f)(void))
+#    else
+extern "C" int atexit(void (*__f)(void)) noexcept
+#    endif
 {
+  if (__f && __hostjit_atexit_n < __hostjit_atexit_max)
+  {
+    __hostjit_atexit_cbs[__hostjit_atexit_n++] = __f;
+  }
   return 0;
 }
-#    else
-extern "C" int atexit(void (*)(void))
+
+#    if !defined(_MSC_VER)
+// Run the captured teardown callbacks (in reverse order, like real atexit) when
+// the dynamic linker unloads this library.
+__attribute__((destructor)) static void __hostjit_run_atexit(void)
 {
-  return 0;
+  while (__hostjit_atexit_n > 0)
+  {
+    void (*__cb)(void) = __hostjit_atexit_cbs[--__hostjit_atexit_n];
+    if (__cb)
+    {
+      __cb();
+    }
+  }
 }
 #    endif
+// Windows (.CRT$XPU / DllMain DLL_PROCESS_DETACH) unload hook: TODO.
 #  endif
 
 #endif // __CUDA__ && __clang__

@@ -1,5 +1,8 @@
 #include <hostjit/loader.hpp>
 
+#include <cstdio>
+#include <cstdlib>
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -195,14 +198,25 @@ void DynamicLibrary::unload()
 {
   if (handle_)
   {
-    // Intentionally do NOT unload (dlclose / FreeLibrary) a compiled JIT module. See #9367.
-    //
-    // Each JIT .so is built by Clang with the classic fatbin embedding (-fcuda-include-gpubinary),
-    // which emits a module ctor (__cuda_module_ctor -> __cudaRegisterFatBinary)
-    // in .init_array but NO matching unregister dtor (.fini_array / __cudaUnregisterFatBinary).
-    // Unloading such a module unmaps its fatbin while the CUDA runtime still holds a pointer to it;
-    // that dangling registration corrupts the runtime's module table, so a later module's kernel
-    // launch silently no-ops.
+    // CFE-104: each JIT module embeds a fatbin via Clang's -fcuda-include-gpubinary,
+    // which emits a module ctor (__cudaRegisterFatBinary) but, in this freestanding
+    // build, no matching unregister at unload. Unloading without unregistering
+    // leaves a dangling entry in the CUDA runtime's module table (#9367), so a
+    // module may only be unloaded once it tears down its own registration.
+#ifdef _WIN32
+    // Windows teardown hook is not implemented yet (the .fini_array unregister in
+    // cuda_minimal/__clang_cuda_runtime_wrapper.h is Linux-only; the Windows
+    // .CRT$XPU / DllMain path is a TODO). There is no safe unload on Windows:
+    // FreeLibrary would reintroduce the #9367 corruption, and silently leaking
+    // would hide the gap. Abort so the missing implementation is unmistakable.
+    std::fprintf(stderr, "CFE-104: Windows fatbin unregister / unload not implemented (#9367)\n");
+    std::abort();
+#else
+    // Linux: the wrapper schedules __cudaUnregisterFatBinary on a .fini_array
+    // destructor, which dlclose runs before unmapping the image, so unloading no
+    // longer leaves a dangling registration. Safe to actually unload.
+    dlclose(handle_);
+#endif
     handle_ = nullptr;
   }
   last_error_.clear();
