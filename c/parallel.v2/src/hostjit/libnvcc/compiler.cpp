@@ -2217,6 +2217,20 @@ public:
       arg_strings.push_back(obj_file);
     }
 
+    // CFE-102: link the compiler-rt builtins archive so compiler-emitted helper
+    // calls (e.g. __divsc3, 128-bit int<->float conversions) resolve at link
+    // time. lld pulls only the objects the image actually references. Gated on
+    // HOSTJIT_LINK_BUILTINS for A/B demonstration; the MVP ships it always.
+    if (const char* want = std::getenv("HOSTJIT_LINK_BUILTINS"); want && want[0] != '0')
+    {
+      namespace fs        = std::filesystem;
+      std::string builtins = std::string(CLANG_RESOURCE_DIR) + "/lib/x86_64-unknown-linux-gnu/libclang_rt.builtins.a";
+      if (fs::exists(builtins))
+      {
+        arg_strings.push_back(builtins);
+      }
+    }
+
     // pip packages ship libcudart.so.XX without an unversioned symlink,
     // so -lcudart won't work.  Find the actual .so by scanning library_paths.
     {
