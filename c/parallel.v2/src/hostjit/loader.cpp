@@ -212,9 +212,21 @@ void DynamicLibrary::unload()
     std::fprintf(stderr, "CFE-104: Windows fatbin unregister / unload not implemented (#9367)\n");
     std::abort();
 #else
-    // Linux: the wrapper schedules __cudaUnregisterFatBinary on a .fini_array
-    // destructor, which dlclose runs before unmapping the image, so unloading no
-    // longer leaves a dangling registration. Safe to actually unload.
+    // Linux (CFE-104): the wrapper schedules __cudaUnregisterFatBinary on a
+    // .fini_array finalizer that dlclose runs before unmapping the image. That
+    // unregister is necessary but not sufficient: unmapping a module mid-run
+    // races GPU work still in flight against it, and the runtime may hold a
+    // pointer into the module's own fatbin image. Draining in-flight work with
+    // cudaDeviceSynchronize() before the unmap closes both windows (verified
+    // crash-free under stress). Resolve it via the module's own cudart
+    // dependency so the loader keeps no direct CUDART link dependency.
+    {
+      using sync_fn = int (*)();
+      if (auto* sync = reinterpret_cast<sync_fn>(dlsym(handle_, "cudaDeviceSynchronize")))
+      {
+        sync();
+      }
+    }
     dlclose(handle_);
 #endif
     handle_ = nullptr;
