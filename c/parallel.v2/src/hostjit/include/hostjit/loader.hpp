@@ -40,6 +40,12 @@ public:
   // Unload the library
   void unload();
 
+  // Absolute path of the currently-loaded module as the OS sees it (via
+  // GetModuleFileName on Windows / dlinfo on Linux), or empty if nothing is
+  // loaded. Lets callers identify the module by its real name at runtime rather
+  // than hard-coding it.
+  std::string getLoadedModulePath() const;
+
 private:
   // Run the atexit callbacks the JIT module captured in its exported table
   // (these unregister the module's fatbin). See unload().

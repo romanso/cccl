@@ -1,3 +1,9 @@
+#ifndef _WIN32
+#  ifndef _GNU_SOURCE
+#    define _GNU_SOURCE // for dlinfo / RTLD_DI_LINKMAP
+#  endif
+#endif
+
 #include <hostjit/loader.hpp>
 
 #include <cstdio>
@@ -8,6 +14,7 @@
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
+#  include <link.h>
 #endif
 
 namespace hostjit
@@ -244,6 +251,26 @@ void DynamicLibrary::unload()
     handle_ = nullptr;
   }
   last_error_.clear();
+}
+
+std::string DynamicLibrary::getLoadedModulePath() const
+{
+  if (!handle_)
+  {
+    return {};
+  }
+#ifdef _WIN32
+  char path[MAX_PATH] = {};
+  DWORD n = GetModuleFileNameA(static_cast<HMODULE>(handle_), path, static_cast<DWORD>(sizeof(path)));
+  return (n > 0) ? std::string(path, n) : std::string{};
+#else
+  struct link_map* lm = nullptr;
+  if (dlinfo(handle_, RTLD_DI_LINKMAP, &lm) == 0 && lm != nullptr && lm->l_name != nullptr)
+  {
+    return std::string(lm->l_name);
+  }
+  return {};
+#endif
 }
 
 void DynamicLibrary::runCapturedAtexitCallbacks()
