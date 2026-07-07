@@ -41,6 +41,10 @@ public:
   void unload();
 
 private:
+  // Run the atexit callbacks the JIT module captured in its exported table
+  // (these unregister the module's fatbin). See unload().
+  void runCapturedAtexitCallbacks();
+
   void* handle_;
   std::string last_error_;
 };
