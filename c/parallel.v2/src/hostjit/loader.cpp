@@ -1,5 +1,8 @@
 #include <hostjit/loader.hpp>
 
+#include <cstdio>
+#include <cstdlib>
+
 #ifdef _WIN32
 #  define WIN32_LEAN_AND_MEAN
 #  include <windows.h>
@@ -195,16 +198,81 @@ void DynamicLibrary::unload()
 {
   if (handle_)
   {
-    // Intentionally do NOT unload (dlclose / FreeLibrary) a compiled JIT module. See #9367.
+    // Kernel launches are asynchronous, so kernels from this module may still be
+    // executing on the GPU when the caller unloads it, and the CUDA runtime keeps
+    // a pointer into the module's embedded fatbin (modules are loaded lazily).
+    // dlclose / FreeLibrary unmaps the module's memory immediately, so without a
+    // barrier a later CUDA call would dereference freed memory and crash.
+    // Synchronize first, so all GPU work referencing the module has finished
+    // before its memory goes away.
     //
-    // Each JIT .so is built by Clang with the classic fatbin embedding (-fcuda-include-gpubinary),
-    // which emits a module ctor (__cuda_module_ctor -> __cudaRegisterFatBinary)
-    // in .init_array but NO matching unregister dtor (.fini_array / __cudaUnregisterFatBinary).
-    // Unloading such a module unmaps its fatbin while the CUDA runtime still holds a pointer to it;
-    // that dangling registration corrupts the runtime's module table, so a later module's kernel
-    // launch silently no-ops.
+    // cudaDeviceSynchronize is looked up by symbol in the loaded module (which
+    // links cudart) rather than called directly, so this file needs no cudart
+    // link dependency. The module always links cudart, so the symbol must
+    // resolve; if it does not, we cannot drain in-flight work and unmapping the
+    // module anyway would risk a use-after-unmap crash -- fail loudly instead of
+    // skipping the barrier silently.
+    {
+      using sync_fn = int (*)();
+#ifdef _WIN32
+      auto sync = reinterpret_cast<sync_fn>(
+        reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), "cudaDeviceSynchronize")));
+#else
+      auto sync = reinterpret_cast<sync_fn>(dlsym(handle_, "cudaDeviceSynchronize"));
+#endif
+      if (!sync)
+      {
+        std::fprintf(stderr, "hostjit: cudaDeviceSynchronize not found in JIT module; cannot safely unload\n");
+        std::abort();
+      }
+      sync();
+    }
+
+    // Clang's fatbin embedding (-fcuda-include-gpubinary) emits a module ctor that
+    // registers the fatbin and schedules __cudaUnregisterFatBinary via atexit. This
+    // freestanding module has no C-runtime atexit, so the wrapper records those
+    // callbacks in an exported table (see __clang_cuda_runtime_wrapper.h); run them
+    // here to unregister the fatbin while the module is still mapped.
+    runCapturedAtexitCallbacks();
+
+    // The fatbin is unregistered, so it is now safe to unmap the module.
+#ifdef _WIN32
+    FreeLibrary(static_cast<HMODULE>(handle_));
+#else
+    dlclose(handle_);
+#endif
     handle_ = nullptr;
   }
   last_error_.clear();
+}
+
+void DynamicLibrary::runCapturedAtexitCallbacks()
+{
+  if (!handle_)
+  {
+    return;
+  }
+
+#ifdef _WIN32
+  auto mod   = static_cast<HMODULE>(handle_);
+  auto count = reinterpret_cast<int*>(GetProcAddress(mod, "hostjit_module_atexit_count"));
+  auto funcs = reinterpret_cast<void(__cdecl**)(void)>(GetProcAddress(mod, "hostjit_module_atexit_funcs"));
+#else
+  auto count = reinterpret_cast<int*>(dlsym(handle_, "hostjit_module_atexit_count"));
+  auto funcs = reinterpret_cast<void (**)(void)>(dlsym(handle_, "hostjit_module_atexit_funcs"));
+#endif
+
+  if (count && funcs)
+  {
+    // Run in reverse registration order, like a real atexit() chain.
+    for (int i = *count - 1; i >= 0; --i)
+    {
+      if (funcs[i])
+      {
+        funcs[i]();
+      }
+    }
+    *count = 0;
+  }
 }
 } // namespace hostjit

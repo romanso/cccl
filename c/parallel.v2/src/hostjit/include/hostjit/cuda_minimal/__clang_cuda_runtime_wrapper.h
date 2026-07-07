@@ -418,20 +418,62 @@ extern "C" unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, siz
 
 // The JIT shared library is linked without the C runtime (no libc on the link
 // line) so atexit is unavailable.  The CUDA module constructor calls atexit()
-// to register a cleanup function.  Provide a no-op stub — the JIT library is
-// short-lived and unloaded explicitly.
+// to register __cuda_module_dtor, which calls __cudaUnregisterFatBinary.  We
+// cannot defer to process exit (no CRT), so instead of discarding the callback
+// (the old no-op stub) we record it in an exported, per-module table.  The
+// host-JIT loader looks this table up and runs the destructors at a controlled
+// unload time, unregistering the fatbin before the module is released.
 #  if !defined(__HOSTJIT_DEVICE_COMPILATION__)
-#    if defined(_MSC_VER)
-extern "C" int atexit(void(__cdecl*)(void))
+extern "C"
 {
-  return 0;
-}
+#    if defined(_WIN32)
+#      define __HOSTJIT_EXPORT __declspec(dllexport)
 #    else
-extern "C" int atexit(void (*)(void))
-{
-  return 0;
-}
+#      define __HOSTJIT_EXPORT __attribute__((visibility("default")))
 #    endif
+
+#    if defined(_MSC_VER)
+  typedef void(__cdecl* __hostjit_atexit_fn)(void);
+#    else
+  typedef void (*__hostjit_atexit_fn)(void);
+#    endif
+
+  // hostjit compiles one translation unit per module, and clang emits exactly one
+  // __cuda_module_ctor per TU, which schedules exactly one atexit(__cuda_module_dtor).
+  // So the invariant is: one captured callback per module. Capacity is therefore 1.
+  //
+  // Linking several host objects into one library (multiple registration TUs, e.g.
+  // separate-compilation / multi-object linking) would break this -- but it does not
+  // compose with this capture anyway: hostjit_module_atexit_* and atexit are strong,
+  // per-TU exported symbols, so several such objects collide at link time. Supporting
+  // it needs a reworked capture (a single shared instance, or a linker-set/section
+  // list). Until then, overflow means the invariant was violated: fail loudly instead
+  // of silently dropping an unregister, which would reintroduce the dangling-fatbin
+  // crash the unload logic exists to prevent.
+  enum
+  {
+    __hostjit_max_atexit = 1
+  };
+
+  // Exported so hostjit's DynamicLibrary::unload() can find and replay them.
+  __HOSTJIT_EXPORT __hostjit_atexit_fn hostjit_module_atexit_funcs[__hostjit_max_atexit] = {0};
+  __HOSTJIT_EXPORT int hostjit_module_atexit_count                                       = 0;
+
+  int atexit(__hostjit_atexit_fn func)
+  {
+    if (!func)
+    {
+      return 0;
+    }
+    if (hostjit_module_atexit_count >= __hostjit_max_atexit)
+    {
+      // More module dtors than the unload mechanism can capture (see the note above).
+      __builtin_trap();
+    }
+    hostjit_module_atexit_funcs[hostjit_module_atexit_count++] = func;
+    return 0;
+  }
+} // extern "C"
 #  endif
 
 #endif // __CUDA__ && __clang__
