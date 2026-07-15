@@ -26,6 +26,8 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/Support/thread.h>
 #include <llvm/Support/VirtualFileSystem.h>
+#include <llvm/Frontend/Offloading/OffloadWrapper.h>
+#include <llvm/Frontend/Offloading/Utility.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 
@@ -904,7 +906,8 @@ public:
     const std::string& input_file,
     const std::string& output_ptx,
     const CompilerOptions& config,
-    std::string& diagnostics)
+    std::string& diagnostics,
+    const std::string& rdc_bitcode_out = "")
   {
     std::string temp_dir    = std::filesystem::path(output_ptx).parent_path().string();
     std::string source_file = temp_dir + "/" + input_file;
@@ -983,6 +986,10 @@ public:
     arg_strings.push_back("-fskip-odr-check-in-gmf");
     arg_strings.push_back("-fcxx-exceptions");
     arg_strings.push_back("-fexceptions");
+    // RDC device codegen: emit relocatable device code so device symbols can be
+    // resolved across translation units when the final link combines every TU's
+    // device code into one fatbin.
+    arg_strings.push_back("-fgpu-rdc");
     arg_strings.push_back("-O" + std::to_string(config.optimization_level));
     arg_strings.push_back("-std=c++17");
 
@@ -1114,6 +1121,23 @@ public:
           {
             // Use AppendToUsed to avoid internalization issues
             llvm::Linker::linkModules(*mod, std::move(libdevice), llvm::Linker::LinkOnlyNeeded);
+          }
+        }
+
+        if (success && !rdc_bitcode_out.empty())
+        {
+          // RDC: persist this TU's device module so the final link can combine
+          // every TU's device code into a single fatbin.
+          std::error_code bec;
+          llvm::raw_fd_ostream bos(rdc_bitcode_out, bec, llvm::sys::fs::OF_None);
+          if (bec)
+          {
+            diagnostics += "Failed to write RDC device bitcode: " + rdc_bitcode_out + "\n";
+          }
+          else
+          {
+            llvm::WriteBitcodeToFile(*mod, bos);
+            bos.flush();
           }
         }
 
@@ -1538,6 +1562,13 @@ public:
     arg_strings.push_back("-fdeprecated-macro");
     arg_strings.push_back("--offload-new-driver");
     arg_strings.push_back("-fskip-odr-check-in-gmf");
+    // RDC host codegen: defer device registration to the final link (one fatbin,
+    // one registration object) instead of baking a fatbin into every object.
+    // -D__HOSTJIT_RDC__ makes the runtime wrapper emit its atexit-capture shim as
+    // weak/hidden so several host objects can be linked into one shared library
+    // without colliding.
+    arg_strings.push_back("-fgpu-rdc");
+    arg_strings.push_back("-D__HOSTJIT_RDC__=1");
     arg_strings.push_back("-O" + std::to_string(config.optimization_level));
     arg_strings.push_back("-std=c++17");
 
@@ -1552,9 +1583,12 @@ public:
 
     std::string host_pch_path = config.host_pch_path;
 
-    // Add fatbin embedding (per-build, not part of PCH)
-    arg_strings.push_back("-fcuda-include-gpubinary");
-    arg_strings.push_back(fatbin_path);
+    // RDC: the device image is not baked into each object. The final link
+    // device-links every TU's device code into one fatbin and registers it via a
+    // generated registration object, so no per-object -fcuda-include-gpubinary
+    // here (that would produce a per-TU registration ctor that collides across
+    // objects). fatbin_path is unused on this path.
+    (void) fatbin_path;
 
     std::vector<const char*> args;
     for (const auto& arg : arg_strings)
@@ -1673,12 +1707,24 @@ public:
       result.diagnostics += "=== Device compilation ===\n";
     }
 
-    if (!compileDeviceToPTX(source_code, input_file, ptx_file, config, result.diagnostics))
+    // RDC: persist this TU's device module to a bitcode sidecar so the final
+    // link can combine every TU's device code into a single fatbin.
+    const std::string rdc_bitcode_out = output_path + ".dev.bc";
+
+    if (!compileDeviceToPTX(source_code, input_file, ptx_file, config, result.diagnostics, rdc_bitcode_out))
     {
       result.diagnostics += "\nDevice compilation failed";
       removeAll(temp_dir);
       return result;
     }
+
+    // Experimental RDC path: the device code was also written to a bitcode
+    // sidecar (rdc_bitcode_out) so the final link can combine every TU's device
+    // code into a single fatbin. Compilation otherwise proceeds normally (the
+    // cubin is still produced for callers that read it); the only difference is
+    // that the host object is built without an embedded fatbin -- see the RDC
+    // gate in compileHostCode -- so it carries only offloading entries and no
+    // per-TU registration ctor.
 
     if (config.verbose)
     {
@@ -2042,6 +2088,262 @@ public:
     return generatePCH(source_code, pch_source_path, pch_output_path, arg_strings, diagnostics);
   }
 
+  // Experimental RDC final link: combine each input object's device-bitcode
+  // sidecar (<obj>.dev.bc) into one fatbin, then synthesize a single host
+  // registration object via llvm::offloading::wrapCudaBinary. The generated
+  // ctor registers that one fatbin and iterates the offloading entries every
+  // host object contributed to the llvm_offload_entries section -- so several
+  // host TUs share exactly one fatbin registration (no per-TU collision).
+  bool buildRdcRegistrationObject(
+    const std::vector<std::string>& object_files,
+    const std::string& output_path,
+    const CompilerOptions& config,
+    std::string& out_reg_obj,
+    std::string& diagnostics)
+  {
+    initialize_llvm();
+    llvm::LLVMContext ctx;
+
+    // 1) Link every TU's device bitcode sidecar into one device module.
+    std::unique_ptr<llvm::Module> device_mod;
+    for (const auto& obj : object_files)
+    {
+      const std::string bc = obj + ".dev.bc";
+      if (!pathExists(bc))
+      {
+        continue;
+      }
+      llvm::SMDiagnostic err;
+      auto m = llvm::parseIRFile(bc, err, ctx);
+      if (!m)
+      {
+        std::string es;
+        llvm::raw_string_ostream os(es);
+        err.print("hostjit", os);
+        diagnostics += "RDC: failed to parse device bitcode " + bc + ": " + es + "\n";
+        return false;
+      }
+      if (!device_mod)
+      {
+        device_mod = std::move(m);
+      }
+      else if (llvm::Linker::linkModules(*device_mod, std::move(m)))
+      {
+        diagnostics += "RDC: failed to device-link " + bc + "\n";
+        return false;
+      }
+    }
+    if (!device_mod)
+    {
+      // No object carries device code -> nothing to device-link or register; the
+      // caller links only the host objects.
+      out_reg_obj.clear();
+      return true;
+    }
+
+    // libdevice for any intrinsics the combined module still references.
+    {
+      const std::string libdevice_path = config.cuda_toolkit_path + "/nvvm/libdevice/libdevice.10.bc";
+      llvm::SMDiagnostic err;
+      if (auto ld = llvm::parseIRFile(libdevice_path, err, ctx))
+      {
+        llvm::Linker::linkModules(*device_mod, std::move(ld), llvm::Linker::LinkOnlyNeeded);
+      }
+    }
+
+    int ptx_version = 78;
+    if (config.sm_version >= 120)
+    {
+      ptx_version = 87;
+    }
+    else if (config.sm_version >= 100)
+    {
+      ptx_version = 85;
+    }
+    else if (config.sm_version >= 90)
+    {
+      ptx_version = 80;
+    }
+
+    // 2) Device module -> PTX via the NVPTX backend.
+    std::string err_str;
+    const llvm::Target* dtarget = llvm::TargetRegistry::lookupTarget(device_mod->getTargetTriple(), err_str);
+    if (!dtarget)
+    {
+      diagnostics += "RDC: NVPTX target not found: " + err_str + "\n";
+      return false;
+    }
+    llvm::TargetOptions dopt;
+    std::unique_ptr<llvm::TargetMachine> dtm(dtarget->createTargetMachine(
+      device_mod->getTargetTriple(),
+      "sm_" + std::to_string(config.sm_version),
+      "+ptx" + std::to_string(ptx_version),
+      dopt,
+      llvm::Reloc::PIC_));
+    if (!dtm)
+    {
+      diagnostics += "RDC: could not create NVPTX target machine\n";
+      return false;
+    }
+    device_mod->setDataLayout(dtm->createDataLayout());
+
+    std::string ptx;
+    {
+      llvm::raw_string_ostream sos(ptx);
+      llvm::buffer_ostream bos(sos);
+      llvm::legacy::PassManager pm;
+      if (dtm->addPassesToEmitFile(pm, bos, nullptr, llvm::CodeGenFileType::AssemblyFile))
+      {
+        diagnostics += "RDC: NVPTX backend cannot emit PTX\n";
+        return false;
+      }
+      pm.run(*device_mod);
+    }
+    if (ptx.empty())
+    {
+      diagnostics += "RDC: empty PTX after device link\n";
+      return false;
+    }
+    if (ptx.back() != '\0')
+    {
+      ptx.push_back('\0');
+    }
+
+    // 3) PTX -> cubin (nvJitLink) -> fatbin (nvFatbin).
+    std::vector<char> fatbin;
+    {
+      const std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
+      const std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
+      const char* jl_opts[]       = {arch_opt.c_str(), opt_level.c_str()};
+      nvJitLinkHandle jl          = nullptr;
+      if (nvJitLinkCreate(&jl, 2, jl_opts) != NVJITLINK_SUCCESS)
+      {
+        diagnostics += "RDC: nvJitLinkCreate failed\n";
+        return false;
+      }
+      if (nvJitLinkAddData(jl, NVJITLINK_INPUT_PTX, ptx.data(), ptx.size(), "device.ptx") != NVJITLINK_SUCCESS)
+      {
+        size_t ls = 0;
+        nvJitLinkGetErrorLogSize(jl, &ls);
+        if (ls > 1)
+        {
+          std::string l(ls, '\0');
+          nvJitLinkGetErrorLog(jl, l.data());
+          diagnostics += "\n" + l;
+        }
+        diagnostics += "RDC: nvJitLinkAddData(PTX) failed\n";
+        nvJitLinkDestroy(&jl);
+        return false;
+      }
+      if (nvJitLinkComplete(jl) != NVJITLINK_SUCCESS)
+      {
+        size_t ls = 0;
+        nvJitLinkGetErrorLogSize(jl, &ls);
+        if (ls > 1)
+        {
+          std::string l(ls, '\0');
+          nvJitLinkGetErrorLog(jl, l.data());
+          diagnostics += "\n" + l;
+        }
+        diagnostics += "RDC: nvJitLinkComplete failed\n";
+        nvJitLinkDestroy(&jl);
+        return false;
+      }
+      size_t cubin_size = 0;
+      nvJitLinkGetLinkedCubinSize(jl, &cubin_size);
+      std::vector<char> cubin(cubin_size);
+      nvJitLinkGetLinkedCubin(jl, cubin.data());
+      nvJitLinkDestroy(&jl);
+
+      const std::string arch       = std::to_string(config.sm_version);
+      const char* fatbin_options[] = {"-64", "-cuda"};
+      nvFatbinHandle fh            = nullptr;
+      if (nvFatbinCreate(&fh, fatbin_options, 2) != NVFATBIN_SUCCESS)
+      {
+        diagnostics += "RDC: nvFatbinCreate failed\n";
+        return false;
+      }
+      if (nvFatbinAddCubin(fh, cubin.data(), cubin.size(), arch.c_str(), "device.cubin") != NVFATBIN_SUCCESS
+          || nvFatbinAddPTX(fh, ptx.data(), ptx.size(), arch.c_str(), "device.ptx", nullptr) != NVFATBIN_SUCCESS)
+      {
+        diagnostics += "RDC: nvFatbinAdd* failed\n";
+        nvFatbinDestroy(&fh);
+        return false;
+      }
+      size_t fsz = 0;
+      if (nvFatbinSize(fh, &fsz) != NVFATBIN_SUCCESS)
+      {
+        diagnostics += "RDC: nvFatbinSize failed\n";
+        nvFatbinDestroy(&fh);
+        return false;
+      }
+      fatbin.resize(fsz);
+      if (nvFatbinGet(fh, fatbin.data()) != NVFATBIN_SUCCESS)
+      {
+        diagnostics += "RDC: nvFatbinGet failed\n";
+        nvFatbinDestroy(&fh);
+        return false;
+      }
+      nvFatbinDestroy(&fh);
+    }
+
+    // 4) Synthesize the host registration module (one fatbin + all entries).
+    llvm::Module regM("hostjit_rdc_registration", ctx);
+#ifdef _WIN32
+    regM.setTargetTriple(llvm::Triple("x86_64-pc-windows-msvc"));
+#else
+    regM.setTargetTriple(llvm::Triple("x86_64-pc-linux-gnu"));
+#endif
+    const llvm::Target* htarget = llvm::TargetRegistry::lookupTarget(regM.getTargetTriple(), err_str);
+    if (!htarget)
+    {
+      diagnostics += "RDC: host target not found: " + err_str + "\n";
+      return false;
+    }
+    llvm::TargetOptions hopt;
+    // Emit constructors into .init_array (processed by the dynamic loader at
+    // dlopen), not the legacy .ctors (which needs CRT startup code absent from
+    // our freestanding .so) -- otherwise the fatbin-registration ctor never runs.
+    hopt.UseInitArray = true;
+    std::unique_ptr<llvm::TargetMachine> htm(
+      htarget->createTargetMachine(regM.getTargetTriple(), "x86-64", "", hopt, llvm::Reloc::PIC_));
+    if (!htm)
+    {
+      diagnostics += "RDC: could not create host target machine\n";
+      return false;
+    }
+    regM.setDataLayout(htm->createDataLayout());
+
+    auto entry_array = llvm::offloading::getOffloadEntryArray(regM, "llvm_offload_entries");
+    llvm::ArrayRef<char> image(fatbin.data(), fatbin.size());
+    if (auto e = llvm::offloading::wrapCudaBinary(regM, image, entry_array))
+    {
+      diagnostics += "RDC: wrapCudaBinary failed: " + llvm::toString(std::move(e)) + "\n";
+      return false;
+    }
+
+    // 5) Emit the registration module to a host object for the final link.
+    out_reg_obj = output_path + ".rdcreg.o";
+    std::error_code ec;
+    llvm::raw_fd_ostream ro(out_reg_obj, ec, llvm::sys::fs::OF_None);
+    if (ec)
+    {
+      diagnostics += "RDC: cannot open registration object " + out_reg_obj + "\n";
+      return false;
+    }
+    {
+      llvm::legacy::PassManager pm;
+      if (htm->addPassesToEmitFile(pm, ro, nullptr, llvm::CodeGenFileType::ObjectFile))
+      {
+        diagnostics += "RDC: host backend cannot emit registration object\n";
+        return false;
+      }
+      pm.run(regM);
+    }
+    ro.flush();
+    return true;
+  }
+
   LinkResult linkToSharedLibrary(
     const std::vector<std::string>& object_files, const std::string& output_path, const CompilerOptions& config)
   {
@@ -2053,6 +2355,24 @@ public:
     {
       result.diagnostics = "No object files provided";
       return result;
+    }
+
+    // RDC: combine the input objects' device bitcode sidecars into one fatbin and
+    // a single registration object, and link that in alongside the host objects.
+    // If none of the objects carry device code, no registration object is
+    // produced and only the host objects are linked.
+    std::vector<std::string> link_objects = object_files;
+    {
+      std::string reg_obj;
+      if (!buildRdcRegistrationObject(object_files, output_path, config, reg_obj, result.diagnostics))
+      {
+        result.diagnostics += "\nRDC registration build failed";
+        return result;
+      }
+      if (!reg_obj.empty())
+      {
+        link_objects.push_back(reg_obj);
+      }
     }
 
     std::vector<std::string> arg_strings;
@@ -2175,7 +2495,7 @@ public:
 
     arg_strings.push_back("/LIBPATH:" + implib_dir);
 
-    for (const auto& obj_file : object_files)
+    for (const auto& obj_file : link_objects)
     {
       arg_strings.push_back(obj_file);
     }
@@ -2208,7 +2528,7 @@ public:
       arg_strings.push_back(lib_path);
     }
 
-    for (const auto& obj_file : object_files)
+    for (const auto& obj_file : link_objects)
     {
       arg_strings.push_back(obj_file);
     }

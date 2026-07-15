@@ -8,26 +8,21 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Multi-piece linking: which link inputs the host-JIT unload capture composes with.
+// Multi-piece linking: several inputs combined into one shared library.
 //
-// The fatbin-unregister capture (atexit shim + exported table in the
-// force-included runtime wrapper) is a per-translation-unit host symbol. That
-// determines what multi-piece linking can and cannot do today:
+// Under RDC (relocatable device code) each host object is compiled with
+// -fgpu-rdc: it carries offloading entries and a device-bitcode sidecar, but no
+// per-object fatbin and no per-TU registration ctor. The final link device-links
+// every object's device code into ONE fatbin and generates a SINGLE registration
+// object (via llvm::offloading::wrapCudaBinary); the atexit-capture shim is weak,
+// so the per-TU copies merge into one instance. Both cases below therefore link,
+// run, and unload cleanly:
 //
-//   * Device code (external LLVM bitcode / LTO-IR) is device-linked into ONE
-//     host object's fatbin. One host object => one copy of the capture symbols =>
-//     links, loads, runs, and unloads cleanly.
-//
-//   * Several *host* objects each carry their own copy of those symbols (each was
-//     compiled through the host-JIT CUDA path). Linking them collides at link time
-//     (duplicate symbol: atexit / hostjit_module_atexit_funcs / _count).
+//   * Device code (external LLVM bitcode / LTO-IR) device-linked into one object.
+//   * Several *host* objects linked together into one shared library.
 //
 // Both are exercised through ONE routine (build_link_run) with different inputs.
-// Current, single-registration-TU expectation:
-//   - device-linking scenario  -> LINKS (and runs)
-//   - two-host-object scenario  -> FAILS to link
-// If the capture is generalized to compose across host translation units, the
-// two-host-object scenario will start linking; update the expectation below then.
+// Expectation: both scenarios LINK and run their entry points.
 
 #include <cstdio>
 #include <filesystem>
@@ -286,28 +281,28 @@ int main()
   const std::vector<HostUnit> device_units = {{"dev.cu", k_src_device, "entry_dev", 41, 42}};
   const LinkOutcome device_outcome         = build_link_run("device-linking (1 host obj + device bitcode)", device_units, {ir});
 
-  // Scenario 2: two host objects. Expected on the current single-registration-TU
-  // capture: FAILS to link (duplicate atexit / hostjit_module_atexit_* symbols).
+  // Scenario 2: two host objects linked into one shared library. Under RDC the
+  // device code combines into one fatbin and a single registration object, so
+  // this links and both entry points run.
   const std::vector<HostUnit> host_units = {
     {"a.cu", k_src_a, "entry_a", 21, 21},
     {"b.cu", k_src_b, "entry_b", 21, 42},
   };
   const LinkOutcome multi_host_outcome = build_link_run("multi-host (2 host objs)", host_units, {});
 
-  // Expectations for the current (single-registration-TU) capture.
   const bool device_ok     = (device_outcome == LinkOutcome::Linked);
-  const bool multi_host_ok = (multi_host_outcome == LinkOutcome::LinkFailed);
+  const bool multi_host_ok = (multi_host_outcome == LinkOutcome::Linked);
 
-  std::printf("\nresult: device-linking=%s (want LINKED), multi-host=%s (want LINK-FAILED)\n",
+  std::printf("\nresult: device-linking=%s (want LINKED), multi-host=%s (want LINKED)\n",
               to_str(device_outcome),
               to_str(multi_host_outcome));
 
   if (device_ok && multi_host_ok)
   {
-    std::printf("multi-TU: PASS (device code links; multiple host objects do not)\n");
+    std::printf("multi-TU: PASS (device code and multiple host objects both link and run)\n");
     return 0;
   }
-  std::printf("multi-TU: FAIL (an outcome did not match the current expectation)\n");
+  std::printf("multi-TU: FAIL (an outcome did not match the expectation)\n");
   std::fflush(stdout);
   std::fflush(stderr);
   return 1;
