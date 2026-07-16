@@ -20,7 +20,7 @@ function(cccl_c_parallel_v2_add_freestanding_test target_name_var source)
   )
   target_link_libraries(
     ${target_name}
-    PRIVATE cccl.c.parallel.v2.hostjit_lib CUDA::cudart
+    PRIVATE cccl.c.parallel.v2.hostjit_lib CUDA::cudart CUDA::nvrtc
   )
 endfunction()
 
