@@ -50,12 +50,18 @@ extern "C" _CCCL_VISIBILITY_EXPORT void run(int* p, int v)
 }
 )";
 
-bool is_elf(const std::string& path)
+bool is_relocatable_object(const std::string& path)
 {
   std::ifstream f(path, std::ios::binary);
   unsigned char m[4] = {};
   f.read(reinterpret_cast<char*>(m), 4);
+#ifdef _WIN32
+  // COFF relocatable object: first two bytes are the machine type (little-endian).
+  // amd64 == IMAGE_FILE_MACHINE_AMD64 (0x8664).
+  return f.gcount() >= 2 && m[0] == 0x64 && m[1] == 0x86;
+#else
   return f.gcount() == 4 && m[0] == 0x7f && m[1] == 'E' && m[2] == 'L' && m[3] == 'F';
+#endif
 }
 } // namespace
 
@@ -94,9 +100,9 @@ int main()
       stderr, "  compile-to-object failed:\n%s\n", hostjit::detail::get_libnvcc_program_log(prog.program).c_str());
     return 1;
   }
-  if (!fs::exists(obj) || fs::file_size(obj) == 0 || !is_elf(obj))
+  if (!fs::exists(obj) || fs::file_size(obj) == 0 || !is_relocatable_object(obj))
   {
-    std::fprintf(stderr, "  host object missing or not an ELF relocatable\n");
+    std::fprintf(stderr, "  host object missing or not a relocatable object\n");
     return 1;
   }
   std::printf("  host object: %s (%ju bytes)\n", obj.c_str(), static_cast<std::uintmax_t>(fs::file_size(obj)));
