@@ -2311,9 +2311,23 @@ public:
     {
       const std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
       const std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
-      const char* jl_opts[]       = {arch_opt.c_str(), opt_level.c_str()};
-      nvJitLinkHandle jl          = nullptr;
-      if (nvJitLinkCreate(&jl, 2, jl_opts) != NVJITLINK_SUCCESS)
+      // External operators supplied as NVRTC LTO-IR (--device-ltoir) are linked
+      // in here, at the final device link, alongside the combined PTX. LTO-IR
+      // inputs require -lto; nvJitLink then resolves the kernel's extern device
+      // symbol(s) from them. Because the kernel arrives as PTX (the clang NVPTX
+      // backend does not emit LTO-IR), this is a *partial* LTO: the symbol
+      // resolves but the operator is not inlined into the kernel. Full
+      // cross-module inlining needs the kernel in LTO-IR too (product path via
+      // libNVVM). Operators supplied as LLVM bitcode (--device-bitcode) are
+      // instead linked + inlined at the IR level before device codegen.
+      const bool have_ltoir = !config.device_ltoir_files.empty();
+      std::vector<const char*> jl_opts{arch_opt.c_str(), opt_level.c_str()};
+      if (have_ltoir)
+      {
+        jl_opts.push_back("-lto");
+      }
+      nvJitLinkHandle jl = nullptr;
+      if (nvJitLinkCreate(&jl, static_cast<uint32_t>(jl_opts.size()), jl_opts.data()) != NVJITLINK_SUCCESS)
       {
         diagnostics += "RDC: nvJitLinkCreate failed\n";
         return false;
@@ -2331,6 +2345,30 @@ public:
         diagnostics += "RDC: nvJitLinkAddData(PTX) failed\n";
         nvJitLinkDestroy(&jl);
         return false;
+      }
+      for (const auto& ltoir_path : config.device_ltoir_files)
+      {
+        std::ifstream f(ltoir_path, std::ios::binary);
+        std::vector<char> buf((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+        if (buf.empty())
+        {
+          continue;
+        }
+        if (nvJitLinkAddData(jl, NVJITLINK_INPUT_LTOIR, buf.data(), buf.size(), ltoir_path.c_str())
+            != NVJITLINK_SUCCESS)
+        {
+          size_t ls = 0;
+          nvJitLinkGetErrorLogSize(jl, &ls);
+          if (ls > 1)
+          {
+            std::string l(ls, '\0');
+            nvJitLinkGetErrorLog(jl, l.data());
+            diagnostics += "\n" + l;
+          }
+          diagnostics += "RDC: nvJitLinkAddData(LTOIR) failed for " + ltoir_path + "\n";
+          nvJitLinkDestroy(&jl);
+          return false;
+        }
       }
       if (nvJitLinkComplete(jl) != NVJITLINK_SUCCESS)
       {
