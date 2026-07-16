@@ -10,6 +10,10 @@
 #include <libnvcc/libnvcc.h>
 #include <lld/Common/Driver.h>
 #include <llvm/Bitcode/BitcodeWriter.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Comdat.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
@@ -1649,10 +1653,15 @@ public:
       diagnostics += "=== End Header Search Paths ===\n\n";
     }
 
+#ifdef _WIN32
+    // On Windows emit the host object ourselves (see below) so we can weaken
+    // `_fltused` first; on other platforms keep clang's direct object emission.
+    llvm::LLVMContext host_context;
+    clang::EmitLLVMOnlyAction emit_action(&host_context);
+#else
     clang::EmitObjAction emit_action;
-    bool success = runWithLargeStack([&] {
-      return compiler.ExecuteAction(emit_action);
-    });
+#endif
+    bool success = runWithLargeStack([&] { return compiler.ExecuteAction(emit_action); });
 
     if (config.trace_includes && compiler.hasSourceManager())
     {
@@ -1664,6 +1673,94 @@ public:
       }
       diagnostics += "=== End Included Files ===\n\n";
     }
+
+#ifdef _WIN32
+    // MSVC/clang emits `_fltused` (a benign FP-usage marker) as a strong external
+    // definition in every host object. Linking several host objects into one
+    // shared library (RDC multi-TU) then fails with "duplicate symbol: _fltused".
+    // Emit it as a COMDAT weak symbol so the COFF linker folds the duplicates.
+    // Manual object emission via addPassesToEmitFile mirrors
+    // buildRdcRegistrationObject and preserves the llvm_offload_entries section.
+    if (success)
+    {
+      std::unique_ptr<llvm::Module> mod = emit_action.takeModule();
+      if (!mod)
+      {
+        diagnostics += "\nHost compile produced no module";
+        success = false;
+      }
+      else
+      {
+        // Fold benign per-TU duplicate definitions across host objects. `_fltused`
+        // (an FP-usage marker) is emitted as a strong external; the wrapper's
+        // `atexit` shim is weak but may lack a COMDAT. Give each a weak COMDAT so
+        // the COFF linker merges the copies instead of erroring with
+        // "duplicate symbol" when several host objects link into one library.
+        for (const char* sym : {"_fltused", "atexit"})
+        {
+          auto* go = llvm::dyn_cast_or_null<llvm::GlobalObject>(mod->getNamedValue(sym));
+          if (!go || go->isDeclaration())
+          {
+            continue;
+          }
+          if (go->getLinkage() == llvm::GlobalValue::ExternalLinkage)
+          {
+            go->setLinkage(llvm::GlobalValue::WeakODRLinkage);
+          }
+          if (!go->getComdat())
+          {
+            llvm::Comdat* c = mod->getOrInsertComdat(sym);
+            c->setSelectionKind(llvm::Comdat::Any);
+            go->setComdat(c);
+          }
+        }
+
+        std::string err_str;
+        const llvm::Target* htarget = llvm::TargetRegistry::lookupTarget(mod->getTargetTriple(), err_str);
+        if (!htarget)
+        {
+          diagnostics += "\nHost target not found: " + err_str;
+          success = false;
+        }
+        else
+        {
+          llvm::TargetOptions hopt;
+          std::unique_ptr<llvm::TargetMachine> htm(
+            htarget->createTargetMachine(mod->getTargetTriple(), "x86-64", "", hopt, llvm::Reloc::PIC_));
+          if (!htm)
+          {
+            diagnostics += "\nCould not create host target machine";
+            success = false;
+          }
+          else
+          {
+            mod->setDataLayout(htm->createDataLayout());
+            std::error_code ec;
+            llvm::raw_fd_ostream ro(output_obj, ec, llvm::sys::fs::OF_None);
+            if (ec)
+            {
+              diagnostics += "\nCannot open host object " + output_obj + ": " + ec.message();
+              success = false;
+            }
+            else
+            {
+              llvm::legacy::PassManager pm;
+              if (htm->addPassesToEmitFile(pm, ro, nullptr, llvm::CodeGenFileType::ObjectFile))
+              {
+                diagnostics += "\nHost backend cannot emit object";
+                success = false;
+              }
+              else
+              {
+                pm.run(*mod);
+              }
+              ro.flush();
+            }
+          }
+        }
+      }
+    }
+#endif
 
     diag_stream.flush();
     diagnostics += diag_output;
@@ -2322,6 +2419,23 @@ public:
       return false;
     }
 
+#ifdef _WIN32
+    // CUDA 13's cudart no longer exports __cudaRegisterSurface / __cudaRegisterTexture
+    // (legacy texture/surface references). wrapCudaBinary still emits calls to them,
+    // but JIT'd CUB kernels never register textures or surfaces, so those calls are
+    // never reached at runtime. Give the declarations a local no-op body so the
+    // Windows DLL links and loads -- otherwise the loader fails with
+    // "The specified procedure could not be found" on the missing cudart imports.
+    for (const char* sym : {"__cudaRegisterSurface", "__cudaRegisterTexture"})
+    {
+      if (auto* f = regM.getFunction(sym); f && f->isDeclaration())
+      {
+        f->setLinkage(llvm::GlobalValue::InternalLinkage);
+        llvm::ReturnInst::Create(ctx, llvm::BasicBlock::Create(ctx, "entry", f));
+      }
+    }
+#endif
+
     // 5) Emit the registration module to a host object for the final link.
     out_reg_obj = output_path + ".rdcreg.o";
     std::error_code ec;
@@ -2425,6 +2539,7 @@ public:
        "__cudaUnregisterFatBinary",
        "__cudaRegisterFunction",
        "__cudaRegisterVar",
+       "__cudaRegisterManagedVar",
        "__cudaPushCallConfiguration",
        "__cudaPopCallConfiguration"},
       implib_dir + "/cudart.lib");
