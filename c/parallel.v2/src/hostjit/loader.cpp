@@ -51,6 +51,39 @@ void runStaticInitializers(HMODULE module)
   }
 }
 
+// GetProcAddress on a loaded DLL only searches that module's own export table,
+// not the DLLs it imports. The JIT module imports cudaDeviceSynchronize from
+// cudart, so resolve it from cudart (already loaded in-process) by scanning all
+// loaded modules. This mirrors Linux dlsym(handle, ...), which follows the
+// module's dependency graph. K32EnumProcessModules is resolved dynamically so
+// no psapi link dependency is introduced.
+void* resolveFromLoadedModules(const char* name)
+{
+  using EnumFn  = BOOL(WINAPI*)(HANDLE, HMODULE*, DWORD, LPDWORD);
+  HMODULE k32   = GetModuleHandleA("kernel32.dll");
+  auto enumMods =
+    k32 ? reinterpret_cast<EnumFn>(reinterpret_cast<void*>(GetProcAddress(k32, "K32EnumProcessModules"))) : nullptr;
+  if (!enumMods)
+  {
+    return nullptr;
+  }
+  HMODULE mods[1024];
+  DWORD needed = 0;
+  if (!enumMods(GetCurrentProcess(), mods, static_cast<DWORD>(sizeof(mods)), &needed))
+  {
+    return nullptr;
+  }
+  const int n = static_cast<int>(needed / sizeof(HMODULE));
+  for (int i = 0; i < n; ++i)
+  {
+    if (auto* s = reinterpret_cast<void*>(GetProcAddress(mods[i], name)))
+    {
+      return s;
+    }
+  }
+  return nullptr;
+}
+
 std::string getWindowsError()
 {
   DWORD error = GetLastError();
@@ -222,8 +255,10 @@ void DynamicLibrary::unload()
     {
       using sync_fn = int (*)();
 #ifdef _WIN32
-      auto sync = reinterpret_cast<sync_fn>(
-        reinterpret_cast<void*>(GetProcAddress(static_cast<HMODULE>(handle_), "cudaDeviceSynchronize")));
+      // Resolve from cudart (imported by the JIT module, already in-process)
+      // rather than the JIT module's own exports -- GetProcAddress on handle_
+      // would not find an imported symbol.
+      auto sync = reinterpret_cast<sync_fn>(resolveFromLoadedModules("cudaDeviceSynchronize"));
 #else
       auto sync = reinterpret_cast<sync_fn>(dlsym(handle_, "cudaDeviceSynchronize"));
 #endif
