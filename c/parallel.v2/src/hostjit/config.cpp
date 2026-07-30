@@ -86,6 +86,14 @@ void CompilerConfig::appendCommandLineArguments(std::vector<std::string>& args) 
   {
     args.push_back("--device-ltoir=" + ltoir_file);
   }
+  if (device_nvvm_bypass)
+  {
+    args.push_back("--device-nvvm-bypass");
+    if (!device_nvvm_ir_out.empty())
+    {
+      args.push_back("--device-nvvm-ir-out=" + device_nvvm_ir_out);
+    }
+  }
   append_cccl_macro_definitions(args);
   for (const auto& [macro_name, macro_value] : macro_definitions)
   {
