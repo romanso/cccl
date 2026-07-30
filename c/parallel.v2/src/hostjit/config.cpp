@@ -165,7 +165,8 @@ CompilerConfig detectDefaultConfig()
   }
 
   // Auto-detect GPU compute capability using CUDA runtime
-  int device = 0;
+  bool sm_detected = false;
+  int device       = 0;
   if (cudaGetDevice(&device) == cudaSuccess)
   {
     cudaDeviceProp prop;
@@ -175,13 +176,25 @@ CompilerConfig detectDefaultConfig()
       if (detected_sm >= 75)
       {
         config.sm_version = detected_sm;
+        sm_detected       = true;
       }
     }
   }
 
-  if (config.sm_version == 0)
+  // Machines with no driver, or with a GPU older than the toolkit supports,
+  // reach here. Falling through would leave the struct default, which CUDA 13
+  // rejects outright. HOSTJIT_SM_VERSION lets such a machine still compile,
+  // which is what the freestanding audits need on a headless host.
+  if (!sm_detected)
   {
     config.sm_version = 75;
+    if (const char* env = std::getenv("HOSTJIT_SM_VERSION"))
+    {
+      if (int requested = std::atoi(env); requested >= 75)
+      {
+        config.sm_version = requested;
+      }
+    }
   }
 
   config.optimization_level = 2;

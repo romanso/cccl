@@ -97,7 +97,11 @@ __FWD_DEVICE __SIZE_TYPE__ __cvta_generic_to_global(const void*);
 __FWD_DEVICE void* __cvta_shared_to_generic(__SIZE_TYPE__);
 __FWD_DEVICE void* __cvta_global_to_generic(__SIZE_TYPE__);
 #  undef __FWD_DEVICE
-#  ifndef _MSC_VER
+// __float128 exists only where the host target has it. On AArch64 it does not:
+// long double is already binary128 there, and clang offers no separate
+// __float128. The device compile inherits host type availability through
+// -aux-triple, so these declarations must follow it.
+#  if !defined(_MSC_VER) && defined(__SIZEOF_FLOAT128__)
 __device__ bool __nv_fp128_isnan(__float128);
 __device__ __float128 __nv_fp128_fmax(__float128, __float128);
 __device__ __float128 __nv_fp128_fmin(__float128, __float128);
