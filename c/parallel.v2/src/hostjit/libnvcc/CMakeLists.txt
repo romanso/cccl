@@ -80,10 +80,13 @@ if (LIBNVCC_USE_PREBUILT_LLVM)
     find_library(
       _libnvcc_zstd_lib
       NAMES zstd libzstd zstd.1 libzstd.so.1
-      PATHS /usr/lib/x86_64-linux-gnu /usr/lib /lib/x86_64-linux-gnu
+      PATHS
+        /usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}
+        /usr/lib
+        /lib/${CMAKE_LIBRARY_ARCHITECTURE}
     )
     if (NOT _libnvcc_zstd_lib)
-      set(_libnvcc_zstd_lib "/usr/lib/x86_64-linux-gnu/libzstd.so.1")
+      set(_libnvcc_zstd_lib "/usr/lib/${CMAKE_LIBRARY_ARCHITECTURE}/libzstd.so.1")
     endif()
     foreach (_zt zstd::libzstd_shared zstd::libzstd_static)
       if (NOT TARGET ${_zt})
@@ -128,7 +131,14 @@ if (LIBNVCC_USE_PREBUILT_LLVM)
 else()
   # List options must be set before CPMAddPackage
   set(LLVM_ENABLE_PROJECTS "clang;lld" CACHE STRING "" FORCE)
-  set(LLVM_TARGETS_TO_BUILD "X86;NVPTX" CACHE STRING "" FORCE)
+  # Only the host backend is built, plus NVPTX for device code.  Building every
+  # backend would roughly double the size of the shipped library.
+  if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
+    set(_libnvcc_host_backend "AArch64")
+  else()
+    set(_libnvcc_host_backend "X86")
+  endif()
+  set(LLVM_TARGETS_TO_BUILD "${_libnvcc_host_backend};NVPTX" CACHE STRING "" FORCE)
 
   CPMAddPackage(
     NAME llvm_project

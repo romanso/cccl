@@ -29,13 +29,21 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
 
-// Selective target initialization (X86 for host, NVPTX for device)
+// Selective target initialization (the host architecture, NVPTX for device)
 extern "C" {
+#if defined(__aarch64__) || defined(_M_ARM64)
+void LLVMInitializeAArch64TargetInfo();
+void LLVMInitializeAArch64Target();
+void LLVMInitializeAArch64TargetMC();
+void LLVMInitializeAArch64AsmPrinter();
+void LLVMInitializeAArch64AsmParser();
+#else
 void LLVMInitializeX86TargetInfo();
 void LLVMInitializeX86Target();
 void LLVMInitializeX86TargetMC();
 void LLVMInitializeX86AsmPrinter();
 void LLVMInitializeX86AsmParser();
+#endif
 void LLVMInitializeNVPTXTargetInfo();
 void LLVMInitializeNVPTXTarget();
 void LLVMInitializeNVPTXTargetMC();
@@ -72,16 +80,47 @@ LLD_HAS_DRIVER(elf)
 
 namespace libnvcc
 {
+// Host code is emitted for the machine the JIT runs on; cross-compiling to a
+// different host is not supported.  compiler-rt lays its per-target archives
+// out under a triple of its own, which is not the one clang is driven with.
+#if defined(__aarch64__) || defined(_M_ARM64)
+#  ifdef _WIN32
+static constexpr const char* host_triple = "aarch64-pc-windows-msvc";
+#  else
+static constexpr const char* host_triple = "aarch64-unknown-linux-gnu";
+#  endif
+static constexpr const char* host_target_cpu       = "generic";
+static constexpr const char* host_lld_emulation    = "aarch64linux";
+static constexpr const char* host_builtins_triple  = "aarch64-unknown-linux-gnu";
+#else
+#  ifdef _WIN32
+static constexpr const char* host_triple = "x86_64-pc-windows-msvc";
+#  else
+static constexpr const char* host_triple = "x86_64-pc-linux-gnu";
+#  endif
+static constexpr const char* host_target_cpu       = "x86-64";
+static constexpr const char* host_lld_emulation    = "elf_x86_64";
+static constexpr const char* host_builtins_triple  = "x86_64-unknown-linux-gnu";
+#endif
+
 static std::once_flag llvm_init_flag;
 
 static void initialize_llvm()
 {
   std::call_once(llvm_init_flag, [] {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    LLVMInitializeAArch64TargetInfo();
+    LLVMInitializeAArch64Target();
+    LLVMInitializeAArch64TargetMC();
+    LLVMInitializeAArch64AsmPrinter();
+    LLVMInitializeAArch64AsmParser();
+#else
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
     LLVMInitializeX86TargetMC();
     LLVMInitializeX86AsmPrinter();
     LLVMInitializeX86AsmParser();
+#endif
     LLVMInitializeNVPTXTargetInfo();
     LLVMInitializeNVPTXTarget();
     LLVMInitializeNVPTXTargetMC();
@@ -933,14 +972,10 @@ public:
     arg_strings.push_back("-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-aux-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(host_triple);
     arg_strings.push_back("-S");
     arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(host_target_cpu);
     arg_strings.push_back("-fcuda-is-device");
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
@@ -1336,14 +1371,10 @@ public:
     arg_strings.push_back("-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-aux-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(host_triple);
     arg_strings.push_back("-S");
     arg_strings.push_back("-aux-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(host_target_cpu);
     arg_strings.push_back("-fcuda-is-device");
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
@@ -1487,17 +1518,13 @@ public:
     std::vector<std::string> arg_strings;
     arg_strings.push_back(source_file);
     arg_strings.push_back("-triple");
-#ifdef _WIN32
-    arg_strings.push_back("x86_64-pc-windows-msvc");
-#else
-    arg_strings.push_back("x86_64-pc-linux-gnu");
-#endif
+    arg_strings.push_back(host_triple);
     arg_strings.push_back("-aux-triple");
     arg_strings.push_back("nvptx64-nvidia-cuda");
     arg_strings.push_back("-target-sdk-version=" CUDA_SDK_VERSION);
     arg_strings.push_back("-emit-obj");
     arg_strings.push_back("-target-cpu");
-    arg_strings.push_back("x86-64");
+    arg_strings.push_back(host_target_cpu);
     arg_strings.push_back("-fcuda-allow-variadic-functions");
 #ifdef _WIN32
     arg_strings.push_back("-fms-compatibility");
@@ -2195,7 +2222,7 @@ public:
     arg_strings.push_back("--build-id");
     arg_strings.push_back("--eh-frame-hdr");
     arg_strings.push_back("-m");
-    arg_strings.push_back("elf_x86_64");
+    arg_strings.push_back(host_lld_emulation);
     // REQ-9: the produced library must not leave external references other
     // than CUDART. Link strictly so any unresolved symbol fails at link time
     // instead of surfacing as a load-time error on the user's machine.
@@ -2224,7 +2251,7 @@ public:
     if (const char* want = std::getenv("HOSTJIT_LINK_BUILTINS"); want && want[0] != '0')
     {
       namespace fs        = std::filesystem;
-      std::string builtins = std::string(CLANG_RESOURCE_DIR) + "/lib/x86_64-unknown-linux-gnu/libclang_rt.builtins.a";
+      std::string builtins = std::string(CLANG_RESOURCE_DIR) + "/lib/" + host_builtins_triple + "/libclang_rt.builtins.a";
       if (fs::exists(builtins))
       {
         arg_strings.push_back(builtins);
