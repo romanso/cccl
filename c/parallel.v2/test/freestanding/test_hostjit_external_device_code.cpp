@@ -28,13 +28,18 @@
 //      nvJitLink -lto at the RDC final link. The kernel is clang-emitted PTX, so
 //      this is *partial* LTO: the extern op is RESOLVED but not inlined (full
 //      inlining needs the kernel in LTO-IR too -- the libNVVM product path).
+//   C. The same NVRTC LTO-IR operator, but with the kernel handed to nvJitLink as
+//      device IR (config.device_nvvm_bypass) instead of PTX. That makes it *full*
+//      LTO: nvJitLink's own NVVM inlines the operator into the kernel, so the
+//      linked cubin ends up with the kernel alone and no call in it.
 //
-// Both cases must build, load, run, and produce the same result. In the product
+// All cases must build, load, run, and produce the same result. In the product
 // the external code is passed in memory (--ltoir-input <data> <size>); the
 // prototype takes a file path -- functionally equivalent for the device link
 // (see chj/cfe_wp/113/scenarios/test_coverage.md).
 
 #include <cstdio>
+#include <elf.h>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -117,16 +122,9 @@ bool make_op_ltoir(int sm_version, const std::string& out_path)
   return static_cast<bool>(f);
 }
 
-// Build k_src (with the operator already attached to config), load, run(5), and
-// check op(5) == 105.
-bool build_run_check(const char* label, hostjit::CompilerConfig config)
+// Launch the entry point of an already-built module and check op(5) == 105.
+bool run_check(const char* label, hostjit::JITCompiler& compiler)
 {
-  hostjit::JITCompiler compiler(config);
-  if (!compiler.compile(k_src))
-  {
-    std::fprintf(stderr, "  [%s] compile/link/load failed: %s\n", label, compiler.getLastError().c_str());
-    return false;
-  }
   auto run = compiler.getFunction<void (*)(int*, int)>("run");
   if (!run)
   {
@@ -155,6 +153,81 @@ bool build_run_check(const char* label, hostjit::CompilerConfig config)
   const bool ok = (got == 105);
   std::printf("  [%s] run(5) -> %d (expected 105): %s\n", label, got, ok ? "ok" : "MISMATCH");
   return ok;
+}
+
+// Build k_src (with the operator already attached to config), load, run(5), and
+// check op(5) == 105.
+bool build_run_check(const char* label, hostjit::CompilerConfig config)
+{
+  hostjit::JITCompiler compiler(config);
+  if (!compiler.compile(k_src))
+  {
+    std::fprintf(stderr, "  [%s] compile/link/load failed: %s\n", label, compiler.getLastError().c_str());
+    return false;
+  }
+  return run_check(label, compiler);
+}
+
+// The two things device IR needs before the NVVM link-time optimizer will take
+// it. Upstream Clang emits neither, which is why the compiler adds them (and a
+// Clang built with -fnvvm-compatible-device-ir emits them itself):
+//
+//  * llvm.used listing the kernels. Nothing inside the device module refers to a
+//    kernel -- the host launches it by name through the runtime -- so without
+//    this the optimizer considers every kernel unreachable and deletes it, and
+//    the link then yields a cubin with no code in it.
+//  * a data layout that does not mark address space 15 as non-integral, which
+//    NVVM rejects outright.
+//
+// Checked before the cubin, because a failure here explains a failure there.
+bool check_nvvm_ir_annotations(const std::string& ir_path)
+{
+  std::ifstream f(ir_path, std::ios::binary);
+  const std::string ir((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+  if (ir.empty())
+  {
+    std::fprintf(stderr, "  [full LTO] no device IR at %s\n", ir_path.c_str());
+    return false;
+  }
+  const bool has_used     = ir.find("llvm.used") != std::string::npos;
+  const bool has_integral = ir.find("-ni:15") == std::string::npos;
+  std::printf("  [full LTO] device IR: kernels in llvm.used: %s, no non-integral address space: %s\n",
+              has_used ? "yes" : "NO",
+              has_integral ? "yes" : "NO");
+  return has_used && has_integral;
+}
+
+// Count the kernel/function bodies in a linked cubin: one .text.<name> section
+// with a non-zero size per function. Zero means the optimizer dropped
+// everything; one means the operator was inlined into the kernel.
+int count_cubin_functions(const std::vector<char>& cubin)
+{
+  if (cubin.size() < sizeof(Elf64_Ehdr))
+  {
+    return -1;
+  }
+  const auto* ehdr = reinterpret_cast<const Elf64_Ehdr*>(cubin.data());
+  if (ehdr->e_shoff == 0 || ehdr->e_shstrndx == SHN_UNDEF)
+  {
+    return -1;
+  }
+  const auto* shdrs = reinterpret_cast<const Elf64_Shdr*>(cubin.data() + ehdr->e_shoff);
+  if (ehdr->e_shoff + static_cast<size_t>(ehdr->e_shnum) * sizeof(Elf64_Shdr) > cubin.size())
+  {
+    return -1;
+  }
+  const char* names = cubin.data() + shdrs[ehdr->e_shstrndx].sh_offset;
+
+  int functions = 0;
+  for (unsigned i = 0; i < ehdr->e_shnum; ++i)
+  {
+    const std::string name = names + shdrs[i].sh_name;
+    if (name.rfind(".text.", 0) == 0 && shdrs[i].sh_size > 0)
+    {
+      ++functions;
+    }
+  }
+  return functions;
 }
 } // namespace
 
@@ -199,7 +272,53 @@ int main()
     b = build_run_check("LTO-IR --device-ltoir (resolved, not inlined)", config);
   }
 
-  const bool ok = a && b;
+  // Transport C: same operator LTO-IR, kernel handed over as device IR, so the
+  // device link is a full LTO and the operator gets inlined into the kernel.
+  bool c = false;
+  {
+    auto config       = hostjit::detectDefaultConfig();
+    config.enable_pch = false;
+
+    const std::string ltoir = (fs::temp_directory_path() / "hostjit_ext_op.ltoir").string();
+    if (!make_op_ltoir(config.sm_version, ltoir))
+    {
+      std::fprintf(stderr, "  could not produce operator LTO-IR via NVRTC\n");
+      return 1;
+    }
+    config.device_ltoir_files.push_back(ltoir);
+    config.device_nvvm_bypass = true;
+    config.device_nvvm_ir_out = (fs::temp_directory_path() / "hostjit_ext_device.nvvm.bc").string();
+    fs::remove(config.device_nvvm_ir_out);
+
+    const char* label = "full LTO";
+    hostjit::JITCompiler compiler(config);
+    if (!compiler.compile(k_src))
+    {
+      std::fprintf(stderr, "  [%s] compile/link/load failed: %s\n", label, compiler.getLastError().c_str());
+      return 1;
+    }
+
+    c = check_nvvm_ir_annotations(config.device_nvvm_ir_out);
+    if (c)
+    {
+      const std::vector<char>& cubin = compiler.getCubin();
+      const int functions            = count_cubin_functions(cubin);
+      // A cubin with no code in it is the failure this transport exists to catch:
+      // that is what comes out when the kernel is not retained across the link.
+      // One function means the operator ended up inlined into the kernel.
+      std::printf("  [%s] linked cubin: %zu bytes, %d function(s)\n", label, cubin.size(), functions);
+      c = functions == 1;
+      if (!c)
+      {
+        std::fprintf(stderr,
+                     functions <= 0 ? "  [full LTO] cubin carries no device code\n"
+                                    : "  [full LTO] operator was not inlined into the kernel\n");
+      }
+    }
+    c = c && run_check(label, compiler);
+  }
+
+  const bool ok = a && b && c;
   std::printf("external-device-code: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
 }
