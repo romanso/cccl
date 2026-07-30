@@ -29,6 +29,15 @@ struct CompilerConfig
   bool trace_includes    = false; // Show all included headers during compilation (for debugging header search)
   bool keep_artifacts    = false; // Keep compiled artifacts for inspection (PTX, object files, etc.)
   bool enable_pch        = false; // Let CCCL create/load cached PCH files before invoking libnvcc
+  // Hand the device LLVM IR to nvJitLink directly instead of going through PTX,
+  // so external LTO-IR operators are inlined into the kernel by nvJitLink's own
+  // NVVM instead of being called across a PTX boundary. Goes in through an entry
+  // point of nvJitLink that is internal but supported for libraries inside the
+  // toolkit; the version-skew and IR-shape caveats are tracked in CFE-113.
+  bool device_nvvm_bypass = false;
+  // Where to keep the device IR handed to nvJitLink in bypass mode; empty means
+  // a temporary that goes away with the rest of the build directory.
+  std::string device_nvvm_ir_out;
 
   void appendCommandLineArguments(std::vector<std::string>& args) const;
 };

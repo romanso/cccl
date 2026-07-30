@@ -34,6 +34,8 @@
 #include <llvm/Frontend/Offloading/Utility.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/TargetParser/Host.h>
+#include <llvm/Transforms/Utils/Cloning.h>
+#include <llvm/Transforms/Utils/ModuleUtils.h>
 
 // Selective target initialization (X86 for host, NVPTX for device)
 extern "C" {
@@ -76,8 +78,20 @@ LLD_HAS_DRIVER(elf)
 #include <nvFatbin.h>
 #include <nvJitLink.h>
 
+// nvJitLink can take NVVM IR directly, through the same entry point NVRTC uses.
+// It is not part of the public header, so it is declared here. Going in this way
+// keeps the kernel in IR form, which lets nvJitLink's own NVVM inline external
+// LTO-IR operators into it instead of calling them across a PTX boundary.
+extern "C" void* __nvJitLinkAPI(int api_kind);
+
 namespace libnvcc
 {
+namespace
+{
+constexpr int nvjitlink_api_add_nvvm = 0xc0fd;
+using nvJitLinkAddNvvmIRFn = nvJitLinkResult (*)(nvJitLinkHandle, const void*, size_t, const char*);
+} // namespace
+
 static std::once_flag llvm_init_flag;
 
 static void initialize_llvm()
@@ -136,6 +150,8 @@ struct CompilerOptions
   bool verbose           = false;
   bool trace_includes    = false;
   bool keep_artifacts    = false;
+  bool device_nvvm_bypass = false;
+  std::string device_nvvm_ir_out;
 };
 
 struct CompilationResult
@@ -426,6 +442,14 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     else if (option.starts_with("--device-ltoir="))
     {
       options.device_ltoir_files.push_back(value_after_equals(option, "--device-ltoir="));
+    }
+    else if (option == "--device-nvvm-bypass")
+    {
+      options.device_nvvm_bypass = true;
+    }
+    else if (option.starts_with("--device-nvvm-ir-out="))
+    {
+      options.device_nvvm_ir_out = value_after_equals(option, "--device-nvvm-ir-out=");
     }
     else if (option.starts_with("--define-macro="))
     {
@@ -905,13 +929,66 @@ public:
     return overlay;
   }
 
+  // Write a copy of the device module in the shape the NVVM reader accepts.
+  //
+  // Two things differ from what Clang emits by default:
+  //
+  //  * the data layout must not mark address space 15 as non-integral, which
+  //    NVVM refuses outright;
+  //  * every kernel has to be listed in llvm.used. Nothing inside the device
+  //    module refers to a kernel -- the host launches it by name through the
+  //    runtime -- so NVVM's link-time optimizer treats kernels as unreachable
+  //    and deletes them, and the link then yields a cubin with no code in it.
+  //
+  // Upstream Clang provides neither, hence the fixup here. A Clang carrying
+  // -fnvvm-compatible-device-ir emits both directly and this becomes a no-op.
+  bool writeNvvmCompatibleBitcode(const llvm::Module& mod, const std::string& path, std::string& diagnostics)
+  {
+    std::unique_ptr<llvm::Module> clone = llvm::CloneModule(mod);
+
+    std::string layout          = clone->getDataLayoutStr();
+    const std::string nonintegral = "-ni:15";
+    if (size_t pos = layout.find(nonintegral); pos != std::string::npos)
+    {
+      layout.erase(pos, nonintegral.size());
+      clone->setDataLayout(layout);
+    }
+
+    std::vector<llvm::GlobalValue*> kernels;
+    for (llvm::Function& fn : *clone)
+    {
+      if (!fn.isDeclaration() && fn.getCallingConv() == llvm::CallingConv::PTX_Kernel)
+      {
+        kernels.push_back(&fn);
+      }
+    }
+    if (kernels.empty())
+    {
+      diagnostics += "No device kernels found while preparing NVVM IR: " + path + "\n";
+      return false;
+    }
+    llvm::appendToUsed(*clone, kernels);
+
+    std::error_code ec;
+    llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
+    if (ec)
+    {
+      diagnostics += "Failed to write NVVM IR: " + path + " (" + ec.message() + ")\n";
+      return false;
+    }
+    llvm::WriteBitcodeToFile(*clone, os);
+    os.flush();
+    return true;
+  }
+
   bool compileDeviceToPTX(
     const std::string& source_code,
     const std::string& input_file,
     const std::string& output_ptx,
     const CompilerOptions& config,
     std::string& diagnostics,
-    const std::string& rdc_bitcode_out = "")
+    const std::string& rdc_bitcode_out = "",
+    const std::string& nvvm_ir_out     = "")
   {
     std::string temp_dir    = std::filesystem::path(output_ptx).parent_path().string();
     std::string source_file = temp_dir + "/" + input_file;
@@ -1143,6 +1220,11 @@ public:
             llvm::WriteBitcodeToFile(*mod, bos);
             bos.flush();
           }
+        }
+
+        if (success && !nvvm_ir_out.empty())
+        {
+          success = writeNvvmCompatibleBitcode(*mod, nvvm_ir_out, diagnostics);
         }
 
         if (success)
@@ -1808,7 +1890,14 @@ public:
     // link can combine every TU's device code into a single fatbin.
     const std::string rdc_bitcode_out = output_path + ".dev.bc";
 
-    if (!compileDeviceToPTX(source_code, input_file, ptx_file, config, result.diagnostics, rdc_bitcode_out))
+    // Bypass mode: keep the device code in IR form for nvJitLink as well.
+    const std::string nvvm_ir_file =
+      !config.device_nvvm_bypass
+        ? std::string()
+        : (config.device_nvvm_ir_out.empty() ? temp_dir + "/device.nvvm.bc" : config.device_nvvm_ir_out);
+
+    if (!compileDeviceToPTX(
+          source_code, input_file, ptx_file, config, result.diagnostics, rdc_bitcode_out, nvvm_ir_file))
     {
       result.diagnostics += "\nDevice compilation failed";
       removeAll(temp_dir);
@@ -1845,13 +1934,27 @@ public:
         ptx_data.push_back('\0');
       }
 
+      std::vector<char> nvvm_ir_data;
+      if (config.device_nvvm_bypass)
+      {
+        std::ifstream f(nvvm_ir_file, std::ios::binary);
+        nvvm_ir_data.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        if (nvvm_ir_data.empty())
+        {
+          result.diagnostics += "\nFailed to read device NVVM IR: " + nvvm_ir_file;
+          removeAll(temp_dir);
+          return result;
+        }
+      }
+
       std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
       std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
       std::vector<std::string> jitlink_option_strs{arch_opt, opt_level};
       // LTOIR inputs require -lto. When present, both the PTX and the LTOIRs
-      // get linked through the LTO codegen path.
+      // get linked through the LTO codegen path. IR handed over directly always
+      // goes through LTO codegen, so bypass mode asks for it unconditionally.
       const bool have_ltoir = !config.device_ltoir_files.empty();
-      if (have_ltoir)
+      if (have_ltoir || config.device_nvvm_bypass)
       {
         jitlink_option_strs.emplace_back("-lto");
       }
@@ -1877,7 +1980,22 @@ public:
         return result;
       }
 
-      jlr = nvJitLinkAddData(jitlink_handle, NVJITLINK_INPUT_PTX, ptx_data.data(), ptx_data.size(), "device.ptx");
+      if (config.device_nvvm_bypass)
+      {
+        auto add_nvvm_ir = reinterpret_cast<nvJitLinkAddNvvmIRFn>(__nvJitLinkAPI(nvjitlink_api_add_nvvm));
+        if (!add_nvvm_ir)
+        {
+          result.diagnostics += "\nnvJitLink does not provide the NVVM IR entry point";
+          nvJitLinkDestroy(&jitlink_handle);
+          removeAll(temp_dir);
+          return result;
+        }
+        jlr = add_nvvm_ir(jitlink_handle, nvvm_ir_data.data(), nvvm_ir_data.size(), "device.nvvm.bc");
+      }
+      else
+      {
+        jlr = nvJitLinkAddData(jitlink_handle, NVJITLINK_INPUT_PTX, ptx_data.data(), ptx_data.size(), "device.ptx");
+      }
       if (jlr != NVJITLINK_SUCCESS)
       {
         size_t log_size = 0;
@@ -1888,7 +2006,8 @@ public:
           nvJitLinkGetErrorLog(jitlink_handle, log.data());
           result.diagnostics += "\n" + log;
         }
-        result.diagnostics += "\nnvJitLinkAddData failed";
+        result.diagnostics += config.device_nvvm_bypass ? "\nnvJitLink NVVM IR input failed"
+                                                       : "\nnvJitLinkAddData failed";
         nvJitLinkDestroy(&jitlink_handle);
         removeAll(temp_dir);
         return result;
@@ -1980,13 +2099,19 @@ public:
         return result;
       }
 
-      fbr = nvFatbinAddPTX(fatbin_handle, ptx_data.data(), ptx_data.size(), arch.c_str(), "device.ptx", nullptr);
-      if (fbr != NVFATBIN_SUCCESS)
+      // In bypass mode the PTX still holds unresolved calls into the external
+      // device code, since it was emitted before the device link. Only the
+      // linked cubin is complete, so the PTX is left out of the fatbin.
+      if (!config.device_nvvm_bypass)
       {
-        result.diagnostics += std::string("\nnvFatbinAddPTX failed: ") + nvFatbinGetErrorString(fbr);
-        nvFatbinDestroy(&fatbin_handle);
-        removeAll(temp_dir);
-        return result;
+        fbr = nvFatbinAddPTX(fatbin_handle, ptx_data.data(), ptx_data.size(), arch.c_str(), "device.ptx", nullptr);
+        if (fbr != NVFATBIN_SUCCESS)
+        {
+          result.diagnostics += std::string("\nnvFatbinAddPTX failed: ") + nvFatbinGetErrorString(fbr);
+          nvFatbinDestroy(&fatbin_handle);
+          removeAll(temp_dir);
+          return result;
+        }
       }
 
       size_t fatbin_size = 0;
