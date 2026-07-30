@@ -62,7 +62,10 @@ const Case cases[] = {
    "struct C { C(); ~C(); };\n"
    "__global__ void k(){}\n"
    "extern \"C\" void f(){ thread_local C c; (void)&c; }\n",
-   false, "tls"},
+   // Keyed on the destructor-registration helper, which every target emits.
+   // x86_64 also emits __tls_get_addr, but aarch64 uses TLSDESC and names no
+   // symbol for the access itself.
+   false, "__cxa_thread_atexit"},
 
   {"R4 complex builtin",
    "__global__ void k(){}\n"
