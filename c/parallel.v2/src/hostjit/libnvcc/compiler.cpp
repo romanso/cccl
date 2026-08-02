@@ -942,7 +942,12 @@ public:
   //
   // Upstream Clang provides neither, hence the fixup here. A Clang carrying
   // -fnvvm-compatible-device-ir emits both directly and this becomes a no-op.
-  bool writeNvvmCompatibleBitcode(const llvm::Module& mod, const std::string& path, std::string& diagnostics)
+  // require_kernels is what the link path wants: a device module about to be
+  // turned into an image has to contain at least one kernel, and an empty
+  // llvm.used there means the cubin will come out empty. A device-only LTO-IR
+  // artifact can legitimately hold device functions and no kernel at all.
+  std::unique_ptr<llvm::Module>
+  makeNvvmCompatibleClone(const llvm::Module& mod, std::string& diagnostics, bool require_kernels = true)
   {
     std::unique_ptr<llvm::Module> clone = llvm::CloneModule(mod);
 
@@ -964,10 +969,27 @@ public:
     }
     if (kernels.empty())
     {
-      diagnostics += "No device kernels found while preparing NVVM IR: " + path + "\n";
+      if (require_kernels)
+      {
+        diagnostics += "No device kernels found while preparing NVVM IR\n";
+        return nullptr;
+      }
+    }
+    else
+    {
+      llvm::appendToUsed(*clone, kernels);
+    }
+    return clone;
+  }
+
+  bool writeNvvmCompatibleBitcode(const llvm::Module& mod, const std::string& path, std::string& diagnostics)
+  {
+    std::unique_ptr<llvm::Module> clone = makeNvvmCompatibleClone(mod, diagnostics);
+    if (!clone)
+    {
+      diagnostics += "while preparing NVVM IR: " + path + "\n";
       return false;
     }
-    llvm::appendToUsed(*clone, kernels);
 
     std::error_code ec;
     llvm::raw_fd_ostream os(path, ec, llvm::sys::fs::OF_None);
@@ -1395,29 +1417,32 @@ public:
     return success;
   }
 
-  BitcodeResult compileToDeviceBitcode(
+  // Run the device half of the compilation and hand back the module. Shared by
+  // the device-only outputs (bitcode and LTO-IR), which differ only in what they
+  // do with it; the object and shared-library paths go through
+  // compileDeviceToPTX instead. The module belongs to llvm_context, so the
+  // caller has to keep that alive for as long as it holds the module.
+  std::unique_ptr<llvm::Module> emitDeviceModule(
     const std::string& source_code,
     const std::string& input_name,
-    const std::string& output_bitcode_path,
-    const CompilerOptions& config)
+    const CompilerOptions& config,
+    llvm::LLVMContext& llvm_context,
+    std::string& diagnostics)
   {
-    BitcodeResult result;
-    result.success = false;
-
     std::string error_msg;
     if (!validateOptions(config, &error_msg))
     {
-      result.diagnostics = "Configuration error: " + error_msg;
-      return result;
+      diagnostics = "Configuration error: " + error_msg;
+      return nullptr;
     }
 
     initialize_llvm();
 
     std::string temp_dir =
       (tempDirectoryPath() / ("hostjit_bc_" + std::to_string(reinterpret_cast<uintptr_t>(this)))).string();
-    if (!createDirectories(temp_dir, result.diagnostics))
+    if (!createDirectories(temp_dir, diagnostics))
     {
-      return result;
+      return nullptr;
     }
 
     std::string input_file   = input_name.empty() ? std::string("input.cu") : input_name;
@@ -1520,9 +1545,9 @@ public:
     if (!clang::CompilerInvocation::CreateFromArgs(invocation, args, diag_engine))
     {
       diag_stream.flush();
-      result.diagnostics = diag_output + "\nFailed to create compiler invocation";
+      diagnostics = diag_output + "\nFailed to create compiler invocation";
       removeAll(temp_dir);
-      return result;
+      return nullptr;
     }
 
     if (!config.device_pch_path.empty())
@@ -1535,49 +1560,166 @@ public:
     compiler.setVirtualFileSystem(vfs);
     compiler.createFileManager();
 
-    llvm::LLVMContext llvm_context;
     clang::EmitLLVMOnlyAction emit_llvm_action(&llvm_context);
     bool success = runWithLargeStack([&] {
       return compiler.ExecuteAction(emit_llvm_action);
     });
 
+    std::unique_ptr<llvm::Module> mod;
     if (success)
     {
-      std::unique_ptr<llvm::Module> mod = emit_llvm_action.takeModule();
-      if (mod)
+      mod = emit_llvm_action.takeModule();
+      if (!mod)
       {
-        std::error_code ec;
-        llvm::raw_fd_ostream os(output_bitcode_path, ec, llvm::sys::fs::OF_None);
-        if (ec)
-        {
-          result.diagnostics = "Failed to open bitcode output file: " + output_bitcode_path + "\n";
-        }
-        else
-        {
-          llvm::WriteBitcodeToFile(*mod, os);
-          os.flush();
-          if (os.has_error())
-          {
-            result.diagnostics = "Failed to write bitcode output file: " + output_bitcode_path + "\n";
-          }
-          else
-          {
-            result.success = true;
-          }
-        }
-      }
-      else
-      {
-        result.diagnostics = "Failed to get LLVM module";
+        diagnostics = "Failed to get LLVM module";
       }
     }
 
     diag_stream.flush();
-    result.diagnostics += diag_output;
+    diagnostics += diag_output;
     if (!config.keep_artifacts)
     {
       removeAll(temp_dir);
     }
+    return mod;
+  }
+
+  BitcodeResult compileToDeviceBitcode(
+    const std::string& source_code,
+    const std::string& input_name,
+    const std::string& output_bitcode_path,
+    const CompilerOptions& config)
+  {
+    BitcodeResult result;
+    result.success = false;
+
+    llvm::LLVMContext llvm_context;
+    std::unique_ptr<llvm::Module> mod = emitDeviceModule(source_code, input_name, config, llvm_context, result.diagnostics);
+    if (!mod)
+    {
+      return result;
+    }
+
+    std::error_code ec;
+    llvm::raw_fd_ostream os(output_bitcode_path, ec, llvm::sys::fs::OF_None);
+    if (ec)
+    {
+      result.diagnostics = "Failed to open bitcode output file: " + output_bitcode_path + "\n" + result.diagnostics;
+      return result;
+    }
+    llvm::WriteBitcodeToFile(*mod, os);
+    os.flush();
+    if (os.has_error())
+    {
+      result.diagnostics = "Failed to write bitcode output file: " + output_bitcode_path + "\n" + result.diagnostics;
+      return result;
+    }
+
+    result.success = true;
+    return result;
+  }
+
+  // Device-only compile whose output is LTO-IR: no host code, no fatbin, and no
+  // final device link. The module goes to nvJitLink as NVVM IR through the same
+  // entry point the bypass link path uses, but the link is relocatable, so
+  // nvJitLink stops at the LTO-IR container instead of running on into ptxas
+  // (which would fail on any unresolved external the caller means to link later).
+  BitcodeResult compileToDeviceLTOIR(
+    const std::string& source_code,
+    const std::string& input_name,
+    const std::string& output_ltoir_path,
+    const CompilerOptions& config)
+  {
+    BitcodeResult result;
+    result.success = false;
+
+    llvm::LLVMContext llvm_context;
+    std::unique_ptr<llvm::Module> mod = emitDeviceModule(source_code, input_name, config, llvm_context, result.diagnostics);
+    if (!mod)
+    {
+      return result;
+    }
+
+    std::unique_ptr<llvm::Module> nvvm_mod = makeNvvmCompatibleClone(*mod, result.diagnostics, /*require_kernels=*/false);
+    if (!nvvm_mod)
+    {
+      return result;
+    }
+
+    llvm::SmallVector<char, 0> nvvm_ir;
+    {
+      llvm::raw_svector_ostream os(nvvm_ir);
+      llvm::WriteBitcodeToFile(*nvvm_mod, os);
+    }
+
+    auto add_nvvm_ir = reinterpret_cast<nvJitLinkAddNvvmIRFn>(__nvJitLinkAPI(nvjitlink_api_add_nvvm));
+    if (!add_nvvm_ir)
+    {
+      result.diagnostics += "\nnvJitLink does not provide the NVVM IR entry point";
+      return result;
+    }
+
+    std::string arch_opt  = "-arch=sm_" + std::to_string(config.sm_version);
+    std::string opt_level = "-O" + std::to_string(config.optimization_level >= 1 ? 3 : 0);
+    const char* jitlink_options[] = {arch_opt.c_str(), opt_level.c_str(), "-lto", "-r"};
+
+    nvJitLinkHandle jitlink_handle = nullptr;
+    nvJitLinkResult jlr            = nvJitLinkCreate(&jitlink_handle, 4, jitlink_options);
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      result.diagnostics += "\nnvJitLinkCreate failed (error " + std::to_string(static_cast<int>(jlr)) + ")";
+      return result;
+    }
+
+    auto fail = [&](const char* what) {
+      size_t log_size = 0;
+      nvJitLinkGetErrorLogSize(jitlink_handle, &log_size);
+      if (log_size > 1)
+      {
+        std::string log(log_size, '\0');
+        nvJitLinkGetErrorLog(jitlink_handle, log.data());
+        result.diagnostics += "\n" + log;
+      }
+      result.diagnostics += std::string("\n") + what;
+      nvJitLinkDestroy(&jitlink_handle);
+      return result;
+    };
+
+    jlr = add_nvvm_ir(jitlink_handle, nvvm_ir.data(), nvvm_ir.size(), "device.nvvm.bc");
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      return fail("nvJitLink NVVM IR input failed");
+    }
+
+    jlr = nvJitLinkComplete(jitlink_handle);
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      return fail("nvJitLinkComplete failed");
+    }
+
+    size_t ltoir_size = 0;
+    jlr               = nvJitLinkGetLinkedLTOIRSize(jitlink_handle, &ltoir_size);
+    if (jlr != NVJITLINK_SUCCESS || ltoir_size == 0)
+    {
+      return fail("nvJitLinkGetLinkedLTOIRSize failed");
+    }
+    std::vector<char> ltoir(ltoir_size);
+    jlr = nvJitLinkGetLinkedLTOIR(jitlink_handle, ltoir.data());
+    if (jlr != NVJITLINK_SUCCESS)
+    {
+      return fail("nvJitLinkGetLinkedLTOIR failed");
+    }
+    nvJitLinkDestroy(&jitlink_handle);
+
+    std::ofstream out(output_ltoir_path, std::ios::binary);
+    out.write(ltoir.data(), static_cast<std::streamsize>(ltoir.size()));
+    if (!out)
+    {
+      result.diagnostics += "\nFailed to write LTO-IR output file: " + output_ltoir_path;
+      return result;
+    }
+
+    result.success = true;
     return result;
   }
 
@@ -2994,6 +3136,30 @@ extern "C" libnvccResult libnvccCompileProgramToDeviceBitcode(
   }
 
   auto result = prog->compiler.compileToDeviceBitcode(prog->source, prog->name, outputBitcodePath, parsed_options);
+  setProgramLog(prog, result.diagnostics);
+  return result.success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_COMPILATION;
+}
+
+extern "C" libnvccResult libnvccCompileProgramToDeviceLTOIR(
+  libnvccProgram prog, const char* outputLtoirPath, int numOptions, const char* const* options)
+{
+  if (!prog)
+  {
+    return LIBNVCC_ERROR_INVALID_PROGRAM;
+  }
+  if (!outputLtoirPath || outputLtoirPath[0] == '\0')
+  {
+    setProgramLog(prog, "outputLtoirPath must be non-empty");
+    return LIBNVCC_ERROR_INVALID_INPUT;
+  }
+
+  libnvcc::CompilerOptions parsed_options;
+  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
+  {
+    return LIBNVCC_ERROR_INVALID_OPTION;
+  }
+
+  auto result = prog->compiler.compileToDeviceLTOIR(prog->source, prog->name, outputLtoirPath, parsed_options);
   setProgramLog(prog, result.diagnostics);
   return result.success ? LIBNVCC_SUCCESS : LIBNVCC_ERROR_COMPILATION;
 }
