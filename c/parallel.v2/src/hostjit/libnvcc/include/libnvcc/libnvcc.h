@@ -111,6 +111,24 @@ libnvccResult libnvccCompileProgramToDeviceBitcode(
   libnvccProgram prog, const char* outputBitcodePath, int numOptions, const char* const* options);
 
 /**
+ * \brief Compile a program's device source to LTO-IR and write it to a file.
+ *
+ * \param prog Program handle created by libnvccCreateProgram.
+ * \param outputLtoirPath Destination path for the generated LTO-IR container.
+ * \param numOptions Number of entries in `options`.
+ * \param options Array of command-line option strings. The array may be NULL
+ * when `numOptions` is zero. The options are the ones listed for
+ * libnvccCompileProgramToDeviceBitcode.
+ *
+ * The result is a device-only artifact meant to be device-linked later, in the
+ * same form an `nvcc -dlto` or NVRTC LTO-IR input arrives in: external device
+ * functions the source calls stay unresolved, and kernels survive so the caller
+ * can still launch them after the link.
+ */
+libnvccResult libnvccCompileProgramToDeviceLTOIR(
+  libnvccProgram prog, const char* outputLtoirPath, int numOptions, const char* const* options);
+
+/**
  * \brief Compile a program to a host object file and optionally a cubin file.
  *
  * \param prog Program handle created by libnvccCreateProgram.
