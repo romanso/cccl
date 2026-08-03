@@ -252,15 +252,16 @@ void DynamicLibrary::unload()
     // resolve; if it does not, we cannot drain in-flight work and unmapping the
     // module anyway would risk a use-after-unmap crash -- fail loudly instead of
     // skipping the barrier silently.
+    using sync_fn = int (*)();
+    sync_fn sync = nullptr;
     {
-      using sync_fn = int (*)();
 #ifdef _WIN32
       // Resolve from cudart (imported by the JIT module, already in-process)
       // rather than the JIT module's own exports -- GetProcAddress on handle_
       // would not find an imported symbol.
-      auto sync = reinterpret_cast<sync_fn>(resolveFromLoadedModules("cudaDeviceSynchronize"));
+      sync = reinterpret_cast<sync_fn>(resolveFromLoadedModules("cudaDeviceSynchronize"));
 #else
-      auto sync = reinterpret_cast<sync_fn>(dlsym(handle_, "cudaDeviceSynchronize"));
+      sync = reinterpret_cast<sync_fn>(dlsym(handle_, "cudaDeviceSynchronize"));
 #endif
       if (!sync)
       {
@@ -276,6 +277,13 @@ void DynamicLibrary::unload()
     // callbacks in an exported table (see __clang_cuda_runtime_wrapper.h); run them
     // here to unregister the fatbin while the module is still mapped.
     runCapturedAtexitCallbacks();
+
+    // Unregistering only queues the module for unload; the runtime issues the
+    // driver call from its next entry point, so without this the module would
+    // stay resident on the device for as long as the process makes no CUDA call.
+    // One more runtime call, made while the module is still mapped, drains that
+    // queue and gives the device state back at unload time.
+    sync();
 
     // The fatbin is unregistered, so it is now safe to unmap the module.
 #ifdef _WIN32
