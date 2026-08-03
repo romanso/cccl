@@ -23,6 +23,18 @@
 //     of the process. After the load/launch/unload loop we count how many JIT
 //     module images are still mapped -- expected 0.
 //
+//  3. Nothing left registered on the other side of the fence. Unmapping the
+//     library says nothing about the runtime and the driver: CUDART only queues
+//     a module for unloading and issues the driver call later, from the next
+//     CUDA entry point, so a module can sit registered after the library is
+//     gone. Free device memory is the observable we have from outside, and it is
+//     sampled after each cycle (after a sync, which drains the queue); if a
+//     registration survived a cycle, the samples drift down as the loop runs.
+//     The module carries 16 MiB of device state to make that visible: measured
+//     here, free memory is exactly 16 MiB lower while the module is resident and
+//     back to the baseline after the unload. Without the ballast the difference
+//     stays below what the driver reports and the check proves nothing.
+//
 // (Skipping unload entirely would pass #1 but fail #2; unloading without proper
 // unregister/drain would pass #2 but fail #1 -- so both checks are needed.)
 //
@@ -55,9 +67,16 @@ static const char* k_source = R"(
 #include <cuda_runtime.h>
 #include <cuda/std/version>
 
+// 16 MiB of device state, so that a module left registered costs device memory
+// that cudaMemGetInfo can actually see. With a small module the difference is
+// below the granularity the driver reports, and the check below would pass no
+// matter what.
+__device__ int ballast[4 * 1024 * 1024];
+
 __global__ void device_kernel(int* ptr, int v)
 {
-  *ptr = v;
+  ballast[0] = v;
+  *ptr       = ballast[0];
 }
 
 extern "C" _CCCL_VISIBILITY_EXPORT void host_entry(int* ptr, int v)
@@ -170,6 +189,11 @@ int main()
   int rc                = 0;
   std::string modname; // JIT module basename, learned at runtime on the first iter
 
+  // Free device memory after each cycle. The first cycles are not comparable
+  // (context and module caches settle), so the comparison starts at kSettle.
+  constexpr int kSettle = 4;
+  size_t free_after[kIters]{};
+
   // (1) Safety: launch + verify each cycle, and issue CUDA work after each unload.
   for (int i = 0; i < kIters; ++i)
   {
@@ -223,6 +247,11 @@ int main()
       rc = 1;
       break;
     }
+    size_t free_bytes = 0, total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess)
+    {
+      free_after[i] = free_bytes;
+    }
     std::printf("unload: iter %d ok (result=%d) after unload\n", i, expected);
   }
 
@@ -243,6 +272,27 @@ int main()
       {
         rc = 1;
       }
+    }
+  }
+
+  // (3) Nothing left registered in the runtime/driver: free device memory must
+  // not drift down across cycles once it has settled.
+  if (rc == 0 && free_after[kSettle] != 0 && free_after[kIters - 1] != 0)
+  {
+    const size_t settled = free_after[kSettle];
+    const size_t final   = free_after[kIters - 1];
+    // One module image is a few KB; a per-cycle registration leak over a dozen
+    // cycles is far above this, while ordinary allocator noise is far below.
+    constexpr size_t kSlackBytes = 1u << 20;
+    const long long drift        = static_cast<long long>(settled) - static_cast<long long>(final);
+    std::printf("unload: free device memory after cycle %d vs %d: %lld byte(s) lower\n",
+                kIters - 1,
+                kSettle,
+                drift);
+    if (drift > static_cast<long long>(kSlackBytes))
+    {
+      std::fprintf(stderr, "unload: device memory keeps dropping -- a module stays registered per cycle\n");
+      rc = 1;
     }
   }
 
