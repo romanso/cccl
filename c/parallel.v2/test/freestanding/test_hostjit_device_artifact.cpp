@@ -19,9 +19,9 @@
 // (chj/cfe_wp/113/scenarios/test_coverage.md):
 //
 //   [reachable]
-//     * device LLVM bitcode to a FILE   (cudaccCompileProgramToDeviceBitcode)
+//     * device LLVM bitcode in memory   (cudaccCompile --bitcode)
 //         -- device-only, no host, no link: matches the scenario's shape.
-//     * LTO-IR to a FILE                 (cudaccCompileProgramToDeviceLTOIR)
+//     * LTO-IR in memory                 (cudaccCompile --ltoir)
 //         -- device-only as well, and checked below by feeding it back in as an
 //            external operator, which is the form the product hands out.
 //     * cubin IN MEMORY                  (JITCompiler::getCubin)
@@ -98,10 +98,10 @@ extern "C" _CCCL_VISIBILITY_EXPORT void run(int* p, int v)
 }
 )";
 
-std::vector<unsigned char> read_bytes(const std::string& path)
+void write_bytes(const std::string& path, const std::vector<char>& bytes)
 {
-  std::ifstream f(path, std::ios::binary);
-  return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+  std::ofstream f(path, std::ios::binary);
+  f.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
 }
 
 // LLVM bitcode ("BC" 0xC0DE) or textual LLVM IR (.ll) written by the compiler.
@@ -130,24 +130,24 @@ bool device_bitcode_to_file()
   auto config = hostjit::detectDefaultConfig();
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
+  options.push_back("--bitcode");
+  options.push_back("scale.cu");
   auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::CudaccProgramGuard prog;
-  if (cudaccCreateProgram(&prog.program, k_device_src, "scale.cu") != CUDACC_SUCCESS)
+  const std::string source        = k_device_src;
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source("scale.cu", source);
+  const cudaccFile* const input[] = {&source_file};
+
+  hostjit::detail::CudaccOutput out;
+  if (cudaccCompile(&out.output, 1, input, static_cast<int>(opt_ptrs.size()), opt_ptrs.data()) != CUDACC_SUCCESS)
   {
-    std::fprintf(stderr, "  createProgram failed\n");
-    return false;
-  }
-  auto r = cudaccCompileProgramToDeviceBitcode(
-    prog.program, bc.c_str(), static_cast<int>(opt_ptrs.size()), opt_ptrs.empty() ? nullptr : opt_ptrs.data());
-  if (r != CUDACC_SUCCESS)
-  {
-    std::fprintf(
-      stderr, "  device-bitcode compile failed:\n%s\n", hostjit::detail::get_cudacc_program_log(prog.program).c_str());
+    std::fprintf(stderr, "  device-bitcode compile failed:\n%s\n", out.log().c_str());
     return false;
   }
 
-  const auto bytes = read_bytes(bc);
+  const auto data = out.data();
+  const std::vector<unsigned char> bytes(data.begin(), data.end());
+  write_bytes(bc, data);
   std::printf("  device bitcode: %zu bytes\n", bytes.size());
   if (bytes.empty() || !looks_like_llvm(bytes))
   {
@@ -199,24 +199,26 @@ bool device_ltoir_to_file()
   auto config = hostjit::detectDefaultConfig();
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
+  options.push_back("--ltoir");
+  options.push_back("op.cu");
   auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::CudaccProgramGuard prog;
-  if (cudaccCreateProgram(&prog.program, k_op_src, "op.cu") != CUDACC_SUCCESS)
+  const std::string source        = k_op_src;
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source("op.cu", source);
+  const cudaccFile* const input[] = {&source_file};
+
+  hostjit::detail::CudaccOutput out;
+  if (cudaccCompile(&out.output, 1, input, static_cast<int>(opt_ptrs.size()), opt_ptrs.data()) != CUDACC_SUCCESS)
   {
-    std::fprintf(stderr, "  createProgram failed\n");
-    return false;
-  }
-  auto r = cudaccCompileProgramToDeviceLTOIR(
-    prog.program, ltoir.c_str(), static_cast<int>(opt_ptrs.size()), opt_ptrs.empty() ? nullptr : opt_ptrs.data());
-  if (r != CUDACC_SUCCESS)
-  {
-    std::fprintf(
-      stderr, "  LTO-IR compile failed:\n%s\n", hostjit::detail::get_cudacc_program_log(prog.program).c_str());
+    std::fprintf(stderr, "  LTO-IR compile failed:\n%s\n", out.log().c_str());
     return false;
   }
 
-  const auto bytes = read_bytes(ltoir);
+  // The artifact comes back in memory; the link step below takes a path, so it
+  // is put on disk here rather than by the compiler.
+  const auto data = out.data();
+  const std::vector<unsigned char> bytes(data.begin(), data.end());
+  write_bytes(ltoir, data);
   std::printf("  device LTO-IR: %zu bytes\n", bytes.size());
   if (bytes.empty())
   {

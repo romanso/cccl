@@ -46,23 +46,25 @@ int main()
 
   const std::string obj = (fs::temp_directory_path() / "hostjit_multiarch.o").string();
 
+  const std::string source        = k_src;
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source("k.cu", source);
+  const cudaccFile* const input[] = {&source_file};
+
   // Baseline: a single architecture compiles. Establishes that the only delta in
   // the multi-arch attempt below is the -gencode options.
   {
-    auto opts = hostjit::detail::make_cudacc_option_ptrs(base);
-    hostjit::detail::CudaccProgramGuard prog;
-    if (cudaccCreateProgram(&prog.program, k_src, "k.cu") != CUDACC_SUCCESS)
-    {
-      std::fprintf(stderr, "  createProgram failed\n");
-      return 1;
-    }
-    auto r = cudaccCompileProgramToObject(
-      prog.program, obj.c_str(), "", static_cast<int>(opts.size()), opts.empty() ? nullptr : opts.data());
+    std::vector<std::string> single = base;
+    single.emplace_back("-c");
+    single.emplace_back("-o");
+    single.push_back(obj);
+    single.emplace_back("k.cu");
+    auto opts = hostjit::detail::make_cudacc_option_ptrs(single);
+
+    hostjit::detail::CudaccOutput out;
+    auto r = cudaccCompile(&out.output, 1, input, static_cast<int>(opts.size()), opts.data());
     if (r != CUDACC_SUCCESS)
     {
-      std::fprintf(stderr,
-                   "  baseline single-arch compile failed (unexpected):\n%s\n",
-                   hostjit::detail::get_cudacc_program_log(prog.program).c_str());
+      std::fprintf(stderr, "  baseline single-arch compile failed (unexpected):\n%s\n", out.log().c_str());
       return 1;
     }
     std::printf("  single-arch (--gpu-architecture): OK\n");
@@ -76,15 +78,14 @@ int main()
     multi.emplace_back("arch=compute_90,code=sm_90");
     multi.emplace_back("-gencode");
     multi.emplace_back("arch=compute_120,code=sm_120");
+    multi.emplace_back("-c");
+    multi.emplace_back("-o");
+    multi.push_back(obj);
+    multi.emplace_back("k.cu");
     auto opts = hostjit::detail::make_cudacc_option_ptrs(multi);
-    hostjit::detail::CudaccProgramGuard prog;
-    if (cudaccCreateProgram(&prog.program, k_src, "k.cu") != CUDACC_SUCCESS)
-    {
-      std::fprintf(stderr, "  createProgram failed\n");
-      return 1;
-    }
-    auto r = cudaccCompileProgramToObject(
-      prog.program, obj.c_str(), "", static_cast<int>(opts.size()), opts.empty() ? nullptr : opts.data());
+
+    hostjit::detail::CudaccOutput out;
+    auto r           = cudaccCompile(&out.output, 1, input, static_cast<int>(opts.size()), opts.data());
     gencode_rejected = (r != CUDACC_SUCCESS);
     std::printf(
       "  -gencode multi-arch: %s (%s)\n", gencode_rejected ? "REJECTED" : "ACCEPTED", cudaccGetErrorString(r));

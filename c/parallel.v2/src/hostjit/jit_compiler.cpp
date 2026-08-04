@@ -56,11 +56,7 @@ std::string get_pch_source_path(const std::string& kind, int sm_version)
 }
 
 bool create_pch_if_needed(
-  hostjit::CompilerConfig config,
-  cudaccPCHKind kind,
-  const std::string& kind_name,
-  std::string& diagnostics,
-  std::string& pch_path)
+  hostjit::CompilerConfig config, const std::string& kind_name, std::string& diagnostics, std::string& pch_path)
 {
   pch_path = get_pch_path(kind_name, config.sm_version);
   if (std::filesystem::exists(pch_path))
@@ -72,32 +68,27 @@ bool create_pch_if_needed(
   config.device_pch_path.clear();
   config.host_pch_path.clear();
 
+  // Clang records the preamble's path inside the PCH, so the source is named by
+  // its cache-stable path rather than by a per-build temporary one.
+  const std::string source_path = get_pch_source_path(kind_name, config.sm_version);
+  const std::string preamble    = pch_preamble_source;
+
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
+  options.push_back("--gen-pch=" + kind_name);
+  options.push_back("-o");
+  options.push_back(pch_path);
+  options.push_back(source_path);
   auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, pch_preamble_source, "hostjit_preamble.cu");
-  if (create_result != CUDACC_SUCCESS)
-  {
-    diagnostics += "Failed to create cudacc PCH program: ";
-    diagnostics += cudaccGetErrorString(create_result);
-    diagnostics += "\n";
-    pch_path.clear();
-    return false;
-  }
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source(source_path.c_str(), preamble);
+  const cudaccFile* const input[] = {&source_file};
 
-  auto source_path = get_pch_source_path(kind_name, config.sm_version);
-  auto pch_result  = cudaccCreatePCH(
-    program.program,
-    kind,
-    source_path.c_str(),
-    pch_path.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
+  hostjit::detail::CudaccOutput out;
+  auto pch_result = cudaccCompile(&out.output, 1, input, static_cast<int>(option_ptrs.size()), option_ptrs.data());
   if (pch_result != CUDACC_SUCCESS)
   {
-    diagnostics += kind_name + " PCH generation failed: " + hostjit::detail::get_cudacc_program_log(program.program);
+    diagnostics += kind_name + " PCH generation failed: " + out.log();
     diagnostics += "\n";
     pch_path.clear();
     return false;
@@ -117,13 +108,13 @@ hostjit::CompilerConfig prepare_pch_config(const hostjit::CompilerConfig& config
   }
 
   std::string device_pch_path;
-  if (create_pch_if_needed(prepared, CUDACC_PCH_DEVICE, "device", diagnostics, device_pch_path))
+  if (create_pch_if_needed(prepared, "device", diagnostics, device_pch_path))
   {
     prepared.device_pch_path = std::move(device_pch_path);
   }
 
   std::string host_pch_path;
-  if (create_pch_if_needed(prepared, CUDACC_PCH_HOST, "host", diagnostics, host_pch_path))
+  if (create_pch_if_needed(prepared, "host", diagnostics, host_pch_path))
   {
     prepared.host_pch_path = std::move(host_pch_path);
   }
@@ -183,28 +174,29 @@ bool JITCompiler::compile(const std::string& source_code)
     std::cout << pch_diagnostics;
   }
 
+#ifdef _WIN32
+  std::string lib_path = temp_dir_ + "/cuda_code.dll";
+#else
+  std::string lib_path = temp_dir_ + "/libcuda_code.so";
+#endif
+  std::string cubin_path = temp_dir_ + "/device.cubin";
+
   std::vector<std::string> options;
   cudacc_config.appendCommandLineArguments(options);
+  options.push_back("--shared");
+  options.push_back("-o");
+  options.push_back(lib_path);
+  // The cubin is a side artifact of the device link; the tests inspect it.
+  options.push_back("--cubin-output=" + cubin_path);
+  options.push_back("input.cu");
   auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, source_code.c_str(), "input.cu");
-  if (create_result != CUDACC_SUCCESS)
-  {
-    last_error_ = std::string("Failed to create cudacc program: ") + cudaccGetErrorString(create_result);
-    removeTempDirectory();
-    return false;
-  }
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source("input.cu", source_code);
+  const cudaccFile* const input[] = {&source_file};
 
-  std::string obj_path   = temp_dir_ + "/cuda_code.o";
-  std::string cubin_path = temp_dir_ + "/device.cubin";
-  auto compile_result    = cudaccCompileProgramToObject(
-    program.program,
-    obj_path.c_str(),
-    cubin_path.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto compile_log = hostjit::detail::get_cudacc_program_log(program.program);
+  hostjit::detail::CudaccOutput out;
+  auto compile_result = cudaccCompile(&out.output, 1, input, static_cast<int>(option_ptrs.size()), option_ptrs.data());
+  auto compile_log    = out.log();
 
   if (compile_result != CUDACC_SUCCESS)
   {
@@ -224,33 +216,6 @@ bool JITCompiler::compile(const std::string& source_code)
   if (config_.verbose)
   {
     std::cout << "Compilation diagnostics:\n" << compile_log << "\n";
-  }
-
-#ifdef _WIN32
-  std::string lib_path = temp_dir_ + "/cuda_code.dll";
-#else
-  std::string lib_path = temp_dir_ + "/libcuda_code.so";
-#endif
-  const char* object_files[] = {obj_path.c_str()};
-  auto link_result           = cudaccLinkToSharedLibrary(
-    program.program,
-    1,
-    object_files,
-    lib_path.c_str(),
-    static_cast<int>(option_ptrs.size()),
-    option_ptrs.empty() ? nullptr : option_ptrs.data());
-  auto link_log = hostjit::detail::get_cudacc_program_log(program.program);
-
-  if (link_result != CUDACC_SUCCESS)
-  {
-    last_error_ = "Linking failed:\n" + link_log;
-    removeTempDirectory();
-    return false;
-  }
-
-  if (config_.verbose)
-  {
-    std::cout << "Linking diagnostics:\n" << link_log << "\n";
   }
 
   if (!library_.load(lib_path))

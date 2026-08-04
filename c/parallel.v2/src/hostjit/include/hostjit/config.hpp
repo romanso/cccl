@@ -28,7 +28,7 @@ struct CompilerConfig
   bool verbose           = false;
   bool trace_includes    = false; // Show all included headers during compilation (for debugging header search)
   bool keep_artifacts    = false; // Keep compiled artifacts for inspection (PTX, object files, etc.)
-  bool enable_pch        = false; // Let CCCL create/load cached PCH files before invoking cudacc
+  bool enable_pch        = false; // Let CCCL create/load cached PCH files before invoking libcudacc
   // Hand the device LLVM IR to nvJitLink directly instead of going through PTX,
   // so external LTO-IR operators are inlined into the kernel by nvJitLink's own
   // NVVM instead of being called across a PTX boundary. Goes in through an entry

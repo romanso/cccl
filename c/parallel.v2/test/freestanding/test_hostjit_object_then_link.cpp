@@ -72,9 +72,8 @@ int main()
 
   auto config       = hostjit::detectDefaultConfig();
   config.enable_pch = false;
-  std::vector<std::string> options;
-  config.appendCommandLineArguments(options);
-  auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
+  std::vector<std::string> base_options;
+  config.appendCommandLineArguments(base_options);
 
   const fs::path dir = fs::temp_directory_path() / ("hostjit_obj_" + std::to_string(std::random_device{}()));
   fs::create_directories(dir);
@@ -86,18 +85,22 @@ int main()
 #endif
 
   // Step 1: source -> host object (-c), a separate compilation step.
-  hostjit::detail::CudaccProgramGuard prog;
-  if (cudaccCreateProgram(&prog.program, k_src, "u.cu") != CUDACC_SUCCESS)
-  {
-    std::fprintf(stderr, "  createProgram failed\n");
-    return 1;
-  }
-  if (cudaccCompileProgramToObject(
-        prog.program, obj.c_str(), "", static_cast<int>(opt_ptrs.size()), opt_ptrs.empty() ? nullptr : opt_ptrs.data())
+  std::vector<std::string> compile_options = base_options;
+  compile_options.emplace_back("-c");
+  compile_options.emplace_back("-o");
+  compile_options.push_back(obj);
+  compile_options.emplace_back("u.cu");
+  auto compile_opts = hostjit::detail::make_cudacc_option_ptrs(compile_options);
+
+  const std::string source        = k_src;
+  const cudaccFile source_file    = hostjit::detail::make_cudacc_source("u.cu", source);
+  const cudaccFile* const input[] = {&source_file};
+
+  hostjit::detail::CudaccOutput out;
+  if (cudaccCompile(&out.output, 1, input, static_cast<int>(compile_opts.size()), compile_opts.data())
       != CUDACC_SUCCESS)
   {
-    std::fprintf(
-      stderr, "  compile-to-object failed:\n%s\n", hostjit::detail::get_cudacc_program_log(prog.program).c_str());
+    std::fprintf(stderr, "  compile-to-object failed:\n%s\n", out.log().c_str());
     return 1;
   }
   if (!fs::exists(obj) || fs::file_size(obj) == 0 || !is_relocatable_object(obj))
@@ -108,24 +111,18 @@ int main()
   std::printf("  host object: %s (%ju bytes)\n", obj.c_str(), static_cast<std::uintmax_t>(fs::file_size(obj)));
 
   // Step 2: link the single object into a shared library (deferred link step).
-  hostjit::detail::CudaccProgramGuard link_prog;
-  if (cudaccCreateProgram(&link_prog.program, "", "u-link") != CUDACC_SUCCESS)
-  {
-    std::fprintf(stderr, "  createProgram (link) failed\n");
-    return 1;
-  }
-  const char* objs[] = {obj.c_str()};
-  if (cudaccLinkToSharedLibrary(
-        link_prog.program,
-        1,
-        objs,
-        lib.c_str(),
-        static_cast<int>(opt_ptrs.size()),
-        opt_ptrs.empty() ? nullptr : opt_ptrs.data())
+  std::vector<std::string> link_options = base_options;
+  link_options.emplace_back("--shared");
+  link_options.emplace_back("-o");
+  link_options.push_back(lib);
+  link_options.push_back(obj);
+  auto link_opts = hostjit::detail::make_cudacc_option_ptrs(link_options);
+
+  hostjit::detail::CudaccOutput link_out;
+  if (cudaccCompile(&link_out.output, 0, nullptr, static_cast<int>(link_opts.size()), link_opts.data())
       != CUDACC_SUCCESS)
   {
-    std::fprintf(
-      stderr, "  link failed:\n%s\n", hostjit::detail::get_cudacc_program_log(link_prog.program).c_str());
+    std::fprintf(stderr, "  link failed:\n%s\n", link_out.log().c_str());
     return 1;
   }
 

@@ -25,7 +25,7 @@ endif()
 
 add_subdirectory(libcudacc)
 
-# Windows does not have an RPATH equivalent. Keep libcudacc.dll in the same
+# Windows does not have an RPATH equivalent. Keep cudacc.dll in the same
 # runtime directory as CCCL's tests/executables so the loader can find it at
 # process startup when no explicit library output directory was requested.
 if (

@@ -1,6 +1,5 @@
 #pragma once
 
-#include <cassert>
 #include <string>
 #include <vector>
 
@@ -8,17 +7,30 @@
 
 namespace hostjit::detail
 {
-struct CudaccProgramGuard
+// Owns one cudaccOutput. The output holds the diagnostics even when the
+// compilation failed, so it is read first and released on the way out.
+struct CudaccOutput
 {
-  cudaccProgram program = nullptr;
+  cudaccOutput output{};
 
-  CudaccProgramGuard()                                      = default;
-  CudaccProgramGuard(const CudaccProgramGuard&)            = delete;
-  CudaccProgramGuard& operator=(const CudaccProgramGuard&) = delete;
+  CudaccOutput()                               = default;
+  CudaccOutput(const CudaccOutput&)            = delete;
+  CudaccOutput& operator=(const CudaccOutput&) = delete;
 
-  ~CudaccProgramGuard()
+  ~CudaccOutput()
   {
-    cudaccDestroyProgram(&program);
+    cudaccDestroyOutput(&output);
+  }
+
+  std::string log() const
+  {
+    return output.program_log ? std::string(output.program_log, output.program_log_size) : std::string();
+  }
+
+  std::vector<char> data() const
+  {
+    const char* bytes = static_cast<const char*>(output.output_data);
+    return bytes ? std::vector<char>(bytes, bytes + output.output_size) : std::vector<char>();
   }
 };
 
@@ -33,25 +45,10 @@ inline std::vector<const char*> make_cudacc_option_ptrs(const std::vector<std::s
   return ptrs;
 }
 
-inline std::string get_cudacc_program_log(cudaccProgram program)
+// A source string handed to cudaccCompile as an in-memory file, named so the
+// command line can refer to it.
+inline cudaccFile make_cudacc_source(const char* name, const std::string& source)
 {
-  size_t log_size = 0;
-  if (cudaccGetProgramLogSize(program, &log_size) != CUDACC_SUCCESS)
-  {
-    return {};
-  }
-
-  assert(log_size > 0 && "Log size should include NUL terminator");
-  if (log_size == 1)
-  {
-    return {};
-  }
-
-  std::string log(log_size, '\0');
-  [[maybe_unused]] auto res = cudaccGetProgramLog(program, log.data());
-  assert(res == CUDACC_SUCCESS && "Copying the log failed even though size calculation succeeded?");
-  assert(log.back() == '\0' && "cudaccGetProgramLog() should append a NUL character");
-  log.pop_back(); // Drop the extra NUL.
-  return log;
+  return cudaccFile{name, source.size(), source.data()};
 }
 } // namespace hostjit::detail

@@ -35,7 +35,7 @@
 
 #include <cuda_runtime.h>
 
-#include <hostjit/compiler.hpp> // cudacc.h + detail helpers (CudaccProgramGuard, option ptrs, log)
+#include <hostjit/compiler.hpp> // cudacc.h + detail helpers (output guard, option ptrs, log)
 #include <hostjit/config.hpp>
 #include <hostjit/loader.hpp>
 
@@ -159,9 +159,8 @@ LinkOutcome build_link_run(
     config.device_bitcode_files.push_back(bc);
   }
 
-  std::vector<std::string> options;
-  config.appendCommandLineArguments(options);
-  auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
+  std::vector<std::string> base_options;
+  config.appendCommandLineArguments(base_options);
 
   namespace fs = std::filesystem;
   fs::path dir = fs::temp_directory_path() / ("hostjit_multitu_" + std::to_string(std::random_device{}()));
@@ -172,22 +171,22 @@ LinkOutcome build_link_run(
   for (size_t i = 0; i < units.size(); ++i)
   {
     const std::string obj = (dir / (std::string("u") + std::to_string(i) + ".o")).string();
-    hostjit::detail::CudaccProgramGuard prog;
-    if (cudaccCreateProgram(&prog.program, units[i].src, units[i].name) != CUDACC_SUCCESS)
-    {
-      std::fprintf(stderr, "  create program failed for %s\n", units[i].name);
-      return LinkOutcome::SetupError;
-    }
-    auto r = cudaccCompileProgramToObject(
-      prog.program,
-      obj.c_str(),
-      /*outputCubinPath*/ "",
-      static_cast<int>(opt_ptrs.size()),
-      opt_ptrs.empty() ? nullptr : opt_ptrs.data());
+    std::vector<std::string> options = base_options;
+    options.emplace_back("-c");
+    options.emplace_back("-o");
+    options.push_back(obj);
+    options.emplace_back(units[i].name);
+    auto opts = hostjit::detail::make_cudacc_option_ptrs(options);
+
+    const std::string source        = units[i].src;
+    const cudaccFile source_file    = hostjit::detail::make_cudacc_source(units[i].name, source);
+    const cudaccFile* const input[] = {&source_file};
+
+    hostjit::detail::CudaccOutput out;
+    auto r = cudaccCompile(&out.output, 1, input, static_cast<int>(opts.size()), opts.data());
     if (r != CUDACC_SUCCESS)
     {
-      std::fprintf(
-        stderr, "  compile failed for %s:\n%s\n", units[i].name, hostjit::detail::get_cudacc_program_log(prog.program).c_str());
+      std::fprintf(stderr, "  compile failed for %s:\n%s\n", units[i].name, out.log().c_str());
       return LinkOutcome::SetupError;
     }
     objs.push_back(obj);
@@ -199,29 +198,23 @@ LinkOutcome build_link_run(
   const std::string lib = (dir / "libmultitu.so").string();
 #endif
 
-  hostjit::detail::CudaccProgramGuard link_prog;
-  if (cudaccCreateProgram(&link_prog.program, "", "multitu-link") != CUDACC_SUCCESS)
-  {
-    return LinkOutcome::SetupError;
-  }
-  std::vector<const char*> obj_ptrs;
-  obj_ptrs.reserve(objs.size());
+  std::vector<std::string> link_options = base_options;
+  link_options.emplace_back("--shared");
+  link_options.emplace_back("-o");
+  link_options.push_back(lib);
   for (const auto& o : objs)
   {
-    obj_ptrs.push_back(o.c_str());
+    link_options.push_back(o);
   }
-  auto lr = cudaccLinkToSharedLibrary(
-    link_prog.program,
-    static_cast<int>(obj_ptrs.size()),
-    obj_ptrs.data(),
-    lib.c_str(),
-    static_cast<int>(opt_ptrs.size()),
-    opt_ptrs.empty() ? nullptr : opt_ptrs.data());
+  auto link_opts = hostjit::detail::make_cudacc_option_ptrs(link_options);
+
+  hostjit::detail::CudaccOutput link_out;
+  auto lr = cudaccCompile(&link_out.output, 0, nullptr, static_cast<int>(link_opts.size()), link_opts.data());
 
   if (lr != CUDACC_SUCCESS)
   {
     // Print a compact first line of the linker error for context.
-    std::string log = hostjit::detail::get_cudacc_program_log(link_prog.program);
+    const std::string log = link_out.log();
     std::printf("  link REJECTED: %.200s%s\n", log.c_str(), log.size() > 200 ? " ..." : "");
     return LinkOutcome::LinkFailed;
   }

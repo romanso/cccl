@@ -107,26 +107,21 @@ bool BitcodeCollector::compile_and_add(const char* source, size_t source_size, c
 
   std::vector<std::string> options;
   config_.appendCommandLineArguments(options);
+  options.push_back("--bitcode");
+  options.push_back("input.cu");
   auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::CudaccProgramGuard program;
-  auto create_result = cudaccCreateProgram(&program.program, src.c_str(), "input.cu");
-  if (create_result != CUDACC_SUCCESS)
-  {
-    fprintf(stderr, "\nERROR creating cudacc program for %s: %s\n", name.c_str(), cudaccGetErrorString(create_result));
-    return false;
-  }
-
-  auto result = cudaccCompileProgramToDeviceBitcode(
-    program.program, path.c_str(), static_cast<int>(option_ptrs.size()), option_ptrs.data());
+  const cudaccFile source_file       = hostjit::detail::make_cudacc_source("input.cu", src);
+  const cudaccFile* const input[]    = {&source_file};
+  hostjit::detail::CudaccOutput out;
+  auto result = cudaccCompile(&out.output, 1, input, static_cast<int>(option_ptrs.size()), option_ptrs.data());
   if (result != CUDACC_SUCCESS)
   {
-    auto log = hostjit::detail::get_cudacc_program_log(program.program);
-    fprintf(stderr, "\nERROR compiling %s to bitcode: %s\n", name.c_str(), log.c_str());
+    fprintf(stderr, "\nERROR compiling %s to bitcode: %s\n", name.c_str(), out.log().c_str());
     return false;
   }
 
-  if (std::filesystem::exists(path))
+  if (write_file(static_cast<const char*>(out.output.output_data), out.output.output_size, path))
   {
     config_.device_bitcode_files.push_back(path);
     temp_paths_.push_back(path);

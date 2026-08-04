@@ -66,6 +66,7 @@ LLD_HAS_DRIVER(elf)
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -129,6 +130,26 @@ static bool runWithLargeStack(Fn&& fn)
   return result;
 }
 
+enum class PCHKind
+{
+  Device,
+  Host
+};
+
+// What the command line asked the compilation to produce. Cubin, LTO-IR and
+// bitcode come back in memory; the rest name a file with -o.
+enum class OutputKind
+{
+  None,
+  Cubin,
+  Ltoir,
+  Bitcode,
+  Object,
+  SharedLibrary,
+  DevicePCH,
+  HostPCH
+};
+
 struct CompilerOptions
 {
   std::string cuda_toolkit_path;
@@ -152,6 +173,13 @@ struct CompilerOptions
   bool keep_artifacts    = false;
   bool device_nvvm_bypass = false;
   std::string device_nvvm_ir_out;
+
+  // Driver-level selections: what to build, from which inputs, and where the
+  // result goes when it goes to a file.
+  OutputKind output_kind = OutputKind::None;
+  std::string output_path;
+  std::string cubin_output_path;
+  std::vector<std::string> input_files;
 };
 
 struct CompilationResult
@@ -531,14 +559,137 @@ static bool parseOptions(int num_options, const char* const* raw_options, Compil
     {
       options.extra_clang_args.emplace_back(option.substr(8));
     }
-    else if (option == "-XClang")
+    else if (option == "-XClang" || option == "-Xclang")
     {
       if (++i >= num_options || raw_options[i] == nullptr)
       {
-        error = "-XClang requires an argument";
+        error = std::string(option) + " requires an argument";
         return false;
       }
       options.extra_clang_args.emplace_back(raw_options[i]);
+    }
+    else if (
+      option == "--cubin" || option == "--ltoir" || option == "--bitcode" || option == "-c" || option == "--shared"
+      || option.starts_with("--gen-pch="))
+    {
+      OutputKind requested = OutputKind::None;
+      if (option == "--cubin")
+      {
+        requested = OutputKind::Cubin;
+      }
+      else if (option == "--ltoir")
+      {
+        requested = OutputKind::Ltoir;
+      }
+      else if (option == "--bitcode")
+      {
+        requested = OutputKind::Bitcode;
+      }
+      else if (option == "-c")
+      {
+        requested = OutputKind::Object;
+      }
+      else if (option == "--shared")
+      {
+        requested = OutputKind::SharedLibrary;
+      }
+      else
+      {
+        const std::string kind = value_after_equals(option, "--gen-pch=");
+        if (kind == "device")
+        {
+          requested = OutputKind::DevicePCH;
+        }
+        else if (kind == "host")
+        {
+          requested = OutputKind::HostPCH;
+        }
+        else
+        {
+          error = "--gen-pch expects device or host, got: " + kind;
+          return false;
+        }
+      }
+
+      if (options.output_kind != OutputKind::None && options.output_kind != requested)
+      {
+        error = "Conflicting output selection: " + std::string(option);
+        return false;
+      }
+      options.output_kind = requested;
+    }
+    else if (option.starts_with("-o") && option.size() > 2)
+    {
+      options.output_path = option.substr(2);
+    }
+    else if (option == "-o")
+    {
+      if (++i >= num_options || raw_options[i] == nullptr)
+      {
+        error = "-o requires an argument";
+        return false;
+      }
+      options.output_path = raw_options[i];
+    }
+    else if (option.starts_with("--cubin-output="))
+    {
+      options.cubin_output_path = value_after_equals(option, "--cubin-output=");
+    }
+    else if (option.starts_with("--ltoir-input="))
+    {
+      options.device_ltoir_files.push_back(value_after_equals(option, "--ltoir-input="));
+    }
+    else if (option == "--ltoir-input")
+    {
+      if (++i >= num_options || raw_options[i] == nullptr)
+      {
+        error = "--ltoir-input requires an argument";
+        return false;
+      }
+      options.device_ltoir_files.emplace_back(raw_options[i]);
+    }
+    else if (option.starts_with("--bitcode-input="))
+    {
+      options.device_bitcode_files.push_back(value_after_equals(option, "--bitcode-input="));
+    }
+    else if (option == "--bitcode-input")
+    {
+      if (++i >= num_options || raw_options[i] == nullptr)
+      {
+        error = "--bitcode-input requires an argument";
+        return false;
+      }
+      options.device_bitcode_files.emplace_back(raw_options[i]);
+    }
+    else if (option.starts_with("--use-pch="))
+    {
+      options.device_pch_path = value_after_equals(option, "--use-pch=");
+    }
+    else if (option == "--use-pch")
+    {
+      if (++i >= num_options || raw_options[i] == nullptr)
+      {
+        error = "--use-pch requires an argument";
+        return false;
+      }
+      options.device_pch_path = raw_options[i];
+    }
+    else if (option.starts_with("--use-host-pch="))
+    {
+      options.host_pch_path = value_after_equals(option, "--use-host-pch=");
+    }
+    else if (option == "--use-host-pch")
+    {
+      if (++i >= num_options || raw_options[i] == nullptr)
+      {
+        error = "--use-host-pch requires an argument";
+        return false;
+      }
+      options.host_pch_path = raw_options[i];
+    }
+    else if (!option.empty() && option.front() != '-')
+    {
+      options.input_files.emplace_back(option);
     }
     else
     {
@@ -2313,7 +2464,7 @@ public:
   }
 
   bool createPCH(const std::string& source_code,
-                 cudaccPCHKind kind,
+                 PCHKind kind,
                  const std::string& pch_source_path,
                  const std::string& pch_output_path,
                  const CompilerOptions& config,
@@ -2332,7 +2483,7 @@ public:
     std::vector<std::string> arg_strings;
     arg_strings.push_back(pch_source_path);
 
-    if (kind == CUDACC_PCH_DEVICE)
+    if (kind == PCHKind::Device)
     {
       int ptx_version = 78;
       if (config.sm_version >= 120)
@@ -2375,7 +2526,7 @@ public:
       arg_strings.push_back("-target-feature");
       arg_strings.push_back("+ptx" + std::to_string(ptx_version));
     }
-    else if (kind == CUDACC_PCH_HOST)
+    else if (kind == PCHKind::Host)
     {
       arg_strings.push_back("-triple");
 #ifdef _WIN32
@@ -2422,7 +2573,7 @@ public:
 
     appendIncludePaths(arg_strings, config);
 
-    if (kind == CUDACC_PCH_DEVICE)
+    if (kind == PCHKind::Device)
     {
       arg_strings.push_back("-D__HOSTJIT_DEVICE_COMPILATION__=1");
     }
@@ -2431,7 +2582,7 @@ public:
     appendMacroDefinitions(arg_strings, config);
 
     arg_strings.push_back("-fdeprecated-macro");
-    if (kind == CUDACC_PCH_DEVICE)
+    if (kind == PCHKind::Device)
     {
       arg_strings.push_back("--offload-new-driver");
       arg_strings.push_back("-fskip-odr-check-in-gmf");
@@ -3029,35 +3180,206 @@ public:
 };
 } // namespace cudacc
 
-struct cudaccProgram_st
-{
-  std::string source;
-  std::string name;
-  std::string log;
-  cudacc::CompilerImpl compiler;
-};
-
 namespace
 {
-void setProgramLog(cudaccProgram prog, std::string log)
+// Everything the compilation is allowed to scribble on: spilled in-memory
+// inputs, and the intermediates of an output that is really several steps
+// (a source going all the way to a shared library, for instance).
+class ScratchDir
 {
-  if (prog)
+public:
+  explicit ScratchDir(bool keep)
+      : keep_(keep)
   {
-    prog->log = std::move(log);
+    static std::atomic<unsigned long> counter{0};
+    path_ = cudacc::tempDirectoryPath()
+          / ("cudacc_" + std::to_string(llvm::sys::Process::getProcessId()) + "_" + std::to_string(counter++));
+    std::error_code ec;
+    std::filesystem::create_directories(path_, ec);
+    ok_ = !ec;
   }
+
+  ~ScratchDir()
+  {
+    if (!keep_ && ok_)
+    {
+      std::error_code ec;
+      std::filesystem::remove_all(path_, ec);
+    }
+  }
+
+  ScratchDir(const ScratchDir&)            = delete;
+  ScratchDir& operator=(const ScratchDir&) = delete;
+
+  bool ok() const
+  {
+    return ok_;
+  }
+
+  std::string file(const std::string& name) const
+  {
+    return (path_ / name).string();
+  }
+
+private:
+  std::filesystem::path path_;
+  bool keep_ = false;
+  bool ok_   = false;
+};
+
+bool hasExtension(std::string_view name, std::initializer_list<std::string_view> extensions)
+{
+  for (std::string_view extension : extensions)
+  {
+    if (name.size() > extension.size() && name.ends_with(extension))
+    {
+      return true;
+    }
+  }
+  return false;
 }
 
-bool parseProgramOptions(
-  cudaccProgram prog, int num_options, const char* const* raw_options, cudacc::CompilerOptions& options)
+bool isSourceInput(std::string_view name)
 {
-  std::string error;
-  if (!cudacc::parseOptions(num_options, raw_options, options, error))
+  return hasExtension(name, {".cu", ".cpp", ".cc", ".cxx", ".c"});
+}
+
+bool readFile(const std::string& path, std::string& contents)
+{
+  std::ifstream stream(path, std::ios::binary);
+  if (!stream)
   {
-    setProgramLog(prog, "Option error: " + error);
     return false;
   }
+  std::stringstream buffer;
+  buffer << stream.rdbuf();
+  contents = buffer.str();
   return true;
 }
+
+bool writeFile(const std::string& path, const void* data, size_t size)
+{
+  std::ofstream stream(path, std::ios::binary);
+  if (!stream)
+  {
+    return false;
+  }
+  stream.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+  return static_cast<bool>(stream);
+}
+
+// The in-memory files, keyed by the name a command-line path has to match to
+// pick one up. Only the file name is compared, so a caller can name a buffer
+// "op.ltoir" and refer to it as "op.ltoir" no matter what directory the rest of
+// the compilation happens in.
+class VirtualFiles
+{
+public:
+  bool add(const cudaccFile& file, std::string& error)
+  {
+    if (!file.file_name || file.file_name[0] == '\0')
+    {
+      error = "A file was passed with no name";
+      return false;
+    }
+    if (file.size != 0 && file.data == nullptr)
+    {
+      error = std::string("File has a size but no data: ") + file.file_name;
+      return false;
+    }
+    const std::string key = std::filesystem::path(file.file_name).filename().string();
+    if (!files_.emplace(key, file).second)
+    {
+      error = "Two files were passed under the same name: " + key;
+      return false;
+    }
+    return true;
+  }
+
+  const cudaccFile* find(const std::string& path) const
+  {
+    auto it = files_.find(std::filesystem::path(path).filename().string());
+    return it == files_.end() ? nullptr : &it->second;
+  }
+
+  // Put every buffer that is not the source on disk under scratch, so the
+  // path-based compile and link steps can reach them. Sidecars a caller passes
+  // along with an object (an <obj>.dev.bc, say) land there too and keep working.
+  bool spill(const ScratchDir& scratch, const std::string& source_name, std::string& error)
+  {
+    for (const auto& [name, file] : files_)
+    {
+      if (name == source_name)
+      {
+        continue;
+      }
+      const std::string path = scratch.file(name);
+      if (!writeFile(path, file.data, file.size))
+      {
+        error = "Could not write " + name + " to " + path;
+        return false;
+      }
+      spilled_.emplace(name, path);
+    }
+    return true;
+  }
+
+  // A command-line path naming one of the spilled buffers is rewritten to where
+  // that buffer landed; anything else is left to be read from disk as given.
+  std::string resolve(const std::string& path) const
+  {
+    auto it = spilled_.find(std::filesystem::path(path).filename().string());
+    return it == spilled_.end() ? path : it->second;
+  }
+
+private:
+  std::map<std::string, cudaccFile> files_;
+  std::map<std::string, std::string> spilled_;
+};
+
+void setOutput(cudaccOutput* output, const void* data, size_t size, const std::string& log)
+{
+  char* log_copy = new char[log.size() + 1];
+  std::memcpy(log_copy, log.c_str(), log.size() + 1);
+  output->program_log      = log_copy;
+  output->program_log_size = log.size();
+
+  if (data == nullptr || size == 0)
+  {
+    output->output_data = nullptr;
+    output->output_size = 0;
+    return;
+  }
+  char* data_copy = new char[size];
+  std::memcpy(data_copy, data, size);
+  output->output_data = data_copy;
+  output->output_size = size;
+}
+
+void setLog(cudaccOutput* output, const std::string& log)
+{
+  setOutput(output, nullptr, 0, log);
+}
+
+// Read back an artifact a compile step wrote to scratch, so it can be returned
+// in memory as the API promises.
+bool takeFile(const std::string& path, cudaccOutput* output, const std::string& log, std::string& error)
+{
+  std::string contents;
+  if (!readFile(path, contents))
+  {
+    error = "Compilation reported success but produced no readable output at " + path;
+    return false;
+  }
+  setOutput(output, contents.data(), contents.size(), log);
+  return true;
+}
+
+// The link step is not thread-safe: lld::elf::link keeps its state in a
+// process-global (CommonLinkerContext, a plain static rather than a
+// thread_local), so concurrent links corrupt LLD's bump allocator. Compilation
+// itself is fine, each build has its own CompilerInstance and LLVMContext.
+std::mutex g_link_mutex;
 } // anonymous namespace
 
 extern "C" const char* cudaccGetErrorString(cudaccResult result)
@@ -3068,12 +3390,8 @@ extern "C" const char* cudaccGetErrorString(cudaccResult result)
       return "CUDACC_SUCCESS";
     case CUDACC_ERROR_OUT_OF_MEMORY:
       return "CUDACC_ERROR_OUT_OF_MEMORY";
-    case CUDACC_ERROR_PROGRAM_CREATION_FAILURE:
-      return "CUDACC_ERROR_PROGRAM_CREATION_FAILURE";
     case CUDACC_ERROR_INVALID_INPUT:
       return "CUDACC_ERROR_INVALID_INPUT";
-    case CUDACC_ERROR_INVALID_PROGRAM:
-      return "CUDACC_ERROR_INVALID_PROGRAM";
     case CUDACC_ERROR_INVALID_OPTION:
       return "CUDACC_ERROR_INVALID_OPTION";
     case CUDACC_ERROR_COMPILATION:
@@ -3088,214 +3406,245 @@ extern "C" const char* cudaccGetErrorString(cudaccResult result)
   return "CUDACC_ERROR_UNKNOWN";
 }
 
-// The compile stages are thread-safe: each build runs clang codegen with its own
-// CompilerInstance and LLVMContext, so concurrent compiles do not race. The link
-// stage is not. lld::elf::link() keeps its state in a process-global
-// (CommonLinkerContext, a plain `static`, not `thread_local`), so concurrent links
-// clobber that shared context and corrupt LLD's bump allocator. Serialize just
-// the link step through one process-wide mutex.
-static std::mutex g_link_mutex;
-
-extern "C" cudaccResult cudaccCreateProgram(cudaccProgram* prog, const char* src, const char* name)
+extern "C" void cudaccDestroyOutput(cudaccOutput* output)
 {
-  if (!prog || !src)
+  if (!output)
+  {
+    return;
+  }
+  delete[] static_cast<const char*>(output->output_data);
+  delete[] output->program_log;
+  *output = cudaccOutput{};
+}
+
+extern "C" cudaccResult cudaccCompile(
+  cudaccOutput* output, int numFiles, const cudaccFile* const* files, int numOptions, const char* const* options)
+{
+  if (!output)
   {
     return CUDACC_ERROR_INVALID_INPUT;
   }
-  *prog = nullptr;
+  *output = cudaccOutput{};
 
-  auto* program   = new cudaccProgram_st;
-  program->source = src;
-  program->name   = (name && name[0]) ? name : "input.cu";
-  *prog           = program;
-  return CUDACC_SUCCESS;
-}
-
-extern "C" cudaccResult cudaccDestroyProgram(cudaccProgram* prog)
-{
-  if (!prog || !*prog)
+  if (numFiles < 0 || (numFiles > 0 && files == nullptr))
   {
-    return CUDACC_SUCCESS;
-  }
-  delete *prog;
-  *prog = nullptr;
-  return CUDACC_SUCCESS;
-}
-
-extern "C" cudaccResult cudaccCompileProgramToDeviceBitcode(
-  cudaccProgram prog, const char* outputBitcodePath, int numOptions, const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!outputBitcodePath || outputBitcodePath[0] == '\0')
-  {
-    setProgramLog(prog, "outputBitcodePath must be non-empty");
+    setLog(output, "Invalid file list");
     return CUDACC_ERROR_INVALID_INPUT;
   }
 
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
+  VirtualFiles virtual_files;
+  for (int i = 0; i < numFiles; ++i)
   {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  auto result = prog->compiler.compileToDeviceBitcode(prog->source, prog->name, outputBitcodePath, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
-}
-
-extern "C" cudaccResult cudaccCompileProgramToDeviceLTOIR(
-  cudaccProgram prog, const char* outputLtoirPath, int numOptions, const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!outputLtoirPath || outputLtoirPath[0] == '\0')
-  {
-    setProgramLog(prog, "outputLtoirPath must be non-empty");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  auto result = prog->compiler.compileToDeviceLTOIR(prog->source, prog->name, outputLtoirPath, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
-}
-
-extern "C" cudaccResult cudaccCompileProgramToObject(
-  cudaccProgram prog,
-  const char* outputObjectPath,
-  const char* outputCubinPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!outputObjectPath || outputObjectPath[0] == '\0')
-  {
-    setProgramLog(prog, "outputObjectPath must be non-empty");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  const std::string cubin_path = outputCubinPath ? outputCubinPath : "";
-  auto result = prog->compiler.compileToObject(prog->source, prog->name, outputObjectPath, cubin_path, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
-}
-
-extern "C" cudaccResult cudaccLinkToSharedLibrary(
-  cudaccProgram prog,
-  int numObjectFiles,
-  const char* const* objectFiles,
-  const char* outputLibraryPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
-  {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (numObjectFiles < 0 || (numObjectFiles > 0 && !objectFiles) || !outputLibraryPath || outputLibraryPath[0] == '\0')
-  {
-    setProgramLog(prog, "Invalid link input");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
-    return CUDACC_ERROR_INVALID_OPTION;
-  }
-
-  std::vector<std::string> object_files;
-  object_files.reserve(static_cast<size_t>(numObjectFiles));
-  for (int i = 0; i < numObjectFiles; ++i)
-  {
-    if (!objectFiles[i] || objectFiles[i][0] == '\0')
+    std::string error;
+    if (files[i] == nullptr)
     {
-      setProgramLog(prog, "Object file path must be non-empty");
+      setLog(output, "A file entry is null");
       return CUDACC_ERROR_INVALID_INPUT;
     }
-    object_files.emplace_back(objectFiles[i]);
+    if (!virtual_files.add(*files[i], error))
+    {
+      setLog(output, error);
+      return CUDACC_ERROR_INVALID_INPUT;
+    }
   }
 
-  const std::lock_guard<std::mutex> lock(g_link_mutex);
-  auto result = prog->compiler.linkToSharedLibrary(object_files, outputLibraryPath, parsed_options);
-  setProgramLog(prog, result.diagnostics);
-  return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_LINKING;
-}
-
-extern "C" cudaccResult cudaccCreatePCH(
-  cudaccProgram prog,
-  cudaccPCHKind kind,
-  const char* pchSourcePath,
-  const char* pchOutputPath,
-  int numOptions,
-  const char* const* options)
-{
-  if (!prog)
+  cudacc::CompilerOptions config;
+  std::string error;
+  if (!cudacc::parseOptions(numOptions, options, config, error))
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!pchSourcePath || pchSourcePath[0] == '\0' || !pchOutputPath || pchOutputPath[0] == '\0')
-  {
-    setProgramLog(prog, "PCH source and output paths must be non-empty");
-    return CUDACC_ERROR_INVALID_INPUT;
-  }
-
-  cudacc::CompilerOptions parsed_options;
-  if (!parseProgramOptions(prog, numOptions, options, parsed_options))
-  {
+    setLog(output, "Option error: " + error);
     return CUDACC_ERROR_INVALID_OPTION;
   }
 
-  std::string diagnostics;
-  bool success =
-    prog->compiler.createPCH(prog->source, kind, pchSourcePath, pchOutputPath, parsed_options, diagnostics);
-  setProgramLog(prog, diagnostics);
-  return success ? CUDACC_SUCCESS : CUDACC_ERROR_PCH_CREATE;
-}
-
-extern "C" cudaccResult cudaccGetProgramLogSize(cudaccProgram prog, size_t* logSizeRet)
-{
-  if (!prog)
+  if (config.output_kind == cudacc::OutputKind::None)
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
+    setLog(output, "No output was requested: pass one of --cubin, --ltoir, --bitcode, -c, --shared, --gen-pch");
+    return CUDACC_ERROR_INVALID_OPTION;
   }
-  if (!logSizeRet)
+
+  const bool writes_a_file = config.output_kind == cudacc::OutputKind::Object
+                          || config.output_kind == cudacc::OutputKind::SharedLibrary
+                          || config.output_kind == cudacc::OutputKind::DevicePCH
+                          || config.output_kind == cudacc::OutputKind::HostPCH;
+  if (writes_a_file && config.output_path.empty())
   {
+    setLog(output, "This output is written to a file, so -o <path> is required");
+    return CUDACC_ERROR_INVALID_OPTION;
+  }
+
+  std::string source_path;
+  std::vector<std::string> object_inputs;
+  for (const auto& input : config.input_files)
+  {
+    if (isSourceInput(input))
+    {
+      if (!source_path.empty())
+      {
+        setLog(output, "At most one source file per compilation, got " + source_path + " and " + input);
+        return CUDACC_ERROR_INVALID_INPUT;
+      }
+      source_path = input;
+    }
+    else
+    {
+      object_inputs.push_back(input);
+    }
+  }
+
+  const bool needs_source = config.output_kind != cudacc::OutputKind::SharedLibrary;
+  if (needs_source && source_path.empty())
+  {
+    setLog(output, "This output is compiled from a source file, but none was given");
     return CUDACC_ERROR_INVALID_INPUT;
   }
-  *logSizeRet = prog->log.size() + 1;
-  return CUDACC_SUCCESS;
-}
-
-extern "C" cudaccResult cudaccGetProgramLog(cudaccProgram prog, char* log)
-{
-  if (!prog)
+  if (config.output_kind == cudacc::OutputKind::SharedLibrary && source_path.empty() && object_inputs.empty())
   {
-    return CUDACC_ERROR_INVALID_PROGRAM;
-  }
-  if (!log)
-  {
+    setLog(output, "A shared library needs a source file or at least one object file");
     return CUDACC_ERROR_INVALID_INPUT;
   }
-  std::memcpy(log, prog->log.c_str(), prog->log.size() + 1);
-  return CUDACC_SUCCESS;
+
+  std::string source_code;
+  const std::string source_name = source_path.empty() ? std::string() : std::filesystem::path(source_path).filename().string();
+  if (!source_path.empty())
+  {
+    if (const cudaccFile* file = virtual_files.find(source_path))
+    {
+      source_code.assign(static_cast<const char*>(file->data), file->size);
+    }
+    else if (!readFile(source_path, source_code))
+    {
+      setLog(output, "Could not read source file " + source_path);
+      return CUDACC_ERROR_INVALID_INPUT;
+    }
+  }
+
+  ScratchDir scratch(config.keep_artifacts);
+  if (!scratch.ok())
+  {
+    setLog(output, "Could not create a working directory");
+    return CUDACC_ERROR_INTERNAL_ERROR;
+  }
+
+  if (!virtual_files.spill(scratch, source_name, error))
+  {
+    setLog(output, error);
+    return CUDACC_ERROR_INTERNAL_ERROR;
+  }
+
+  for (auto& path : config.device_ltoir_files)
+  {
+    path = virtual_files.resolve(path);
+  }
+  for (auto& path : config.device_bitcode_files)
+  {
+    path = virtual_files.resolve(path);
+  }
+  for (auto& path : object_inputs)
+  {
+    path = virtual_files.resolve(path);
+  }
+  if (!config.device_pch_path.empty())
+  {
+    config.device_pch_path = virtual_files.resolve(config.device_pch_path);
+  }
+  if (!config.host_pch_path.empty())
+  {
+    config.host_pch_path = virtual_files.resolve(config.host_pch_path);
+  }
+
+  cudacc::CompilerImpl compiler;
+
+  switch (config.output_kind)
+  {
+    case cudacc::OutputKind::Bitcode:
+    case cudacc::OutputKind::Ltoir: {
+      const std::string artifact = scratch.file(config.output_kind == cudacc::OutputKind::Ltoir ? "out.ltoir" : "out.bc");
+      auto result = config.output_kind == cudacc::OutputKind::Ltoir
+                    ? compiler.compileToDeviceLTOIR(source_code, source_name, artifact, config)
+                    : compiler.compileToDeviceBitcode(source_code, source_name, artifact, config);
+      if (!result.success)
+      {
+        setLog(output, result.diagnostics);
+        return CUDACC_ERROR_COMPILATION;
+      }
+      if (!takeFile(artifact, output, result.diagnostics, error))
+      {
+        setLog(output, result.diagnostics + "\n" + error);
+        return CUDACC_ERROR_INTERNAL_ERROR;
+      }
+      return CUDACC_SUCCESS;
+    }
+
+    case cudacc::OutputKind::Cubin: {
+      // The cubin falls out of the object compilation as a side artifact; the
+      // object itself is of no interest here.
+      const std::string object = scratch.file("out.o");
+      const std::string cubin  = scratch.file("out.cubin");
+      auto result              = compiler.compileToObject(source_code, source_name, object, cubin, config);
+      if (!result.success)
+      {
+        setLog(output, result.diagnostics);
+        return CUDACC_ERROR_COMPILATION;
+      }
+      if (!takeFile(cubin, output, result.diagnostics, error))
+      {
+        setLog(output, result.diagnostics + "\n" + error);
+        return CUDACC_ERROR_INTERNAL_ERROR;
+      }
+      return CUDACC_SUCCESS;
+    }
+
+    case cudacc::OutputKind::Object: {
+      auto result =
+        compiler.compileToObject(source_code, source_name, config.output_path, config.cubin_output_path, config);
+      setLog(output, result.diagnostics);
+      return result.success ? CUDACC_SUCCESS : CUDACC_ERROR_COMPILATION;
+    }
+
+    case cudacc::OutputKind::SharedLibrary: {
+      std::string log;
+      std::vector<std::string> objects;
+      if (!source_path.empty())
+      {
+        // The source has to become an object before the link; its device code
+        // reaches the device link through the sidecar the object step leaves
+        // next to it.
+        const std::string object = scratch.file(source_name + ".o");
+        auto compiled = compiler.compileToObject(source_code, source_name, object, config.cubin_output_path, config);
+        log += compiled.diagnostics;
+        if (!compiled.success)
+        {
+          setLog(output, log);
+          return CUDACC_ERROR_COMPILATION;
+        }
+        objects.push_back(object);
+      }
+      objects.insert(objects.end(), object_inputs.begin(), object_inputs.end());
+
+      const std::lock_guard<std::mutex> lock(g_link_mutex);
+      auto linked = compiler.linkToSharedLibrary(objects, config.output_path, config);
+      log += linked.diagnostics;
+      setLog(output, log);
+      return linked.success ? CUDACC_SUCCESS : CUDACC_ERROR_LINKING;
+    }
+
+    case cudacc::OutputKind::DevicePCH:
+    case cudacc::OutputKind::HostPCH: {
+      // Clang records the source path inside the PCH, so the name the caller
+      // gave the source is used as-is: it has to stay stable across the builds
+      // that share the cached PCH.
+      const auto kind =
+        config.output_kind == cudacc::OutputKind::DevicePCH ? cudacc::PCHKind::Device : cudacc::PCHKind::Host;
+      std::string diagnostics;
+      const bool ok = compiler.createPCH(source_code, kind, source_path, config.output_path, config, diagnostics);
+      setLog(output, diagnostics);
+      return ok ? CUDACC_SUCCESS : CUDACC_ERROR_PCH_CREATE;
+    }
+
+    case cudacc::OutputKind::None:
+      break;
+  }
+
+  setLog(output, "Unhandled output kind");
+  return CUDACC_ERROR_INTERNAL_ERROR;
 }

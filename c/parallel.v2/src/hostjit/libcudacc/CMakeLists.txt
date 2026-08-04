@@ -187,7 +187,6 @@ set_target_properties(
   cudacc
   PROPERTIES
     CXX_STANDARD 20
-    PREFIX ""
     POSITION_INDEPENDENT_CODE ON
     WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
