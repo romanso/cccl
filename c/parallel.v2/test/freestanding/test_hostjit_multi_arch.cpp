@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include <hostjit/compiler.hpp> // libnvcc.h + detail helpers
+#include <hostjit/compiler.hpp> // cudacc.h + detail helpers
 #include <hostjit/config.hpp>
 
 namespace
@@ -49,20 +49,20 @@ int main()
   // Baseline: a single architecture compiles. Establishes that the only delta in
   // the multi-arch attempt below is the -gencode options.
   {
-    auto opts = hostjit::detail::make_libnvcc_option_ptrs(base);
-    hostjit::detail::LibnvccProgramGuard prog;
-    if (libnvccCreateProgram(&prog.program, k_src, "k.cu") != LIBNVCC_SUCCESS)
+    auto opts = hostjit::detail::make_cudacc_option_ptrs(base);
+    hostjit::detail::CudaccProgramGuard prog;
+    if (cudaccCreateProgram(&prog.program, k_src, "k.cu") != CUDACC_SUCCESS)
     {
       std::fprintf(stderr, "  createProgram failed\n");
       return 1;
     }
-    auto r = libnvccCompileProgramToObject(
+    auto r = cudaccCompileProgramToObject(
       prog.program, obj.c_str(), "", static_cast<int>(opts.size()), opts.empty() ? nullptr : opts.data());
-    if (r != LIBNVCC_SUCCESS)
+    if (r != CUDACC_SUCCESS)
     {
       std::fprintf(stderr,
                    "  baseline single-arch compile failed (unexpected):\n%s\n",
-                   hostjit::detail::get_libnvcc_program_log(prog.program).c_str());
+                   hostjit::detail::get_cudacc_program_log(prog.program).c_str());
       return 1;
     }
     std::printf("  single-arch (--gpu-architecture): OK\n");
@@ -76,18 +76,18 @@ int main()
     multi.emplace_back("arch=compute_90,code=sm_90");
     multi.emplace_back("-gencode");
     multi.emplace_back("arch=compute_120,code=sm_120");
-    auto opts = hostjit::detail::make_libnvcc_option_ptrs(multi);
-    hostjit::detail::LibnvccProgramGuard prog;
-    if (libnvccCreateProgram(&prog.program, k_src, "k.cu") != LIBNVCC_SUCCESS)
+    auto opts = hostjit::detail::make_cudacc_option_ptrs(multi);
+    hostjit::detail::CudaccProgramGuard prog;
+    if (cudaccCreateProgram(&prog.program, k_src, "k.cu") != CUDACC_SUCCESS)
     {
       std::fprintf(stderr, "  createProgram failed\n");
       return 1;
     }
-    auto r = libnvccCompileProgramToObject(
+    auto r = cudaccCompileProgramToObject(
       prog.program, obj.c_str(), "", static_cast<int>(opts.size()), opts.empty() ? nullptr : opts.data());
-    gencode_rejected = (r != LIBNVCC_SUCCESS);
+    gencode_rejected = (r != CUDACC_SUCCESS);
     std::printf(
-      "  -gencode multi-arch: %s (%s)\n", gencode_rejected ? "REJECTED" : "ACCEPTED", libnvccGetErrorString(r));
+      "  -gencode multi-arch: %s (%s)\n", gencode_rejected ? "REJECTED" : "ACCEPTED", cudaccGetErrorString(r));
     if (!gencode_rejected)
     {
       std::fprintf(stderr, "  -gencode was accepted -- multi-arch may now be supported; update this probe\n");

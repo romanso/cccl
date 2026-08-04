@@ -74,7 +74,7 @@ set(CMAKE_INSTALL_INCLUDEDIR "${old_includedir}") # pop
 # Install version-specific binaries
 set(_cccl_c_parallel_install_targets ${_cccl_c_parallel_target})
 if (CCCL_PYTHON_USE_V2)
-  list(APPEND _cccl_c_parallel_install_targets libnvcc)
+  list(APPEND _cccl_c_parallel_install_targets cudacc)
 endif()
 install(
   TARGETS ${_cccl_c_parallel_install_targets}

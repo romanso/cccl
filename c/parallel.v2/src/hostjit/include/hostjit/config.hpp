@@ -21,14 +21,14 @@ struct CompilerConfig
   std::vector<std::string> device_ltoir_files; // NVRTC LTOIR; linked at the nvJitLink stage with -lto
   std::unordered_map<std::string, std::string> macro_definitions; // key=macro name, value=macro value (empty for flag
                                                                   // macros)
-  std::vector<std::string> extra_clang_args; // Arguments passed directly to Clang via libnvcc's -XClang option
+  std::vector<std::string> extra_clang_args; // Arguments passed directly to Clang via libcudacc's -XClang option
   int sm_version         = 75;
   int optimization_level = 2;
   bool debug             = false;
   bool verbose           = false;
   bool trace_includes    = false; // Show all included headers during compilation (for debugging header search)
   bool keep_artifacts    = false; // Keep compiled artifacts for inspection (PTX, object files, etc.)
-  bool enable_pch        = false; // Let CCCL create/load cached PCH files before invoking libnvcc
+  bool enable_pch        = false; // Let CCCL create/load cached PCH files before invoking cudacc
   // Hand the device LLVM IR to nvJitLink directly instead of going through PTX,
   // so external LTO-IR operators are inlined into the kernel by nvJitLink's own
   // NVVM instead of being called across a PTX boundary. Goes in through an entry

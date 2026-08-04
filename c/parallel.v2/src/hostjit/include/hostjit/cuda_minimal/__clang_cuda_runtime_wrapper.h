@@ -434,7 +434,7 @@ extern "C"
 
 // RDC mode (default): several host objects are linked into one shared library and
 // the single fatbin registration comes from a generated registration object (see
-// libnvcc's buildRdcRegistrationObject). Emit the capture shim so the per-TU
+// libcudacc's buildRdcRegistrationObject). Emit the capture shim so the per-TU
 // copies MERGE into one instance instead of colliding at link, and keep the table
 // exported so the loader can find it (dlsym / GetProcAddress).
 //   * Linux/ELF: weak; atexit is additionally hidden so the registration object's

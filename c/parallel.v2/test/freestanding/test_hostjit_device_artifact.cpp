@@ -19,9 +19,9 @@
 // (chj/cfe_wp/113/scenarios/test_coverage.md):
 //
 //   [reachable]
-//     * device LLVM bitcode to a FILE   (libnvccCompileProgramToDeviceBitcode)
+//     * device LLVM bitcode to a FILE   (cudaccCompileProgramToDeviceBitcode)
 //         -- device-only, no host, no link: matches the scenario's shape.
-//     * LTO-IR to a FILE                 (libnvccCompileProgramToDeviceLTOIR)
+//     * LTO-IR to a FILE                 (cudaccCompileProgramToDeviceLTOIR)
 //         -- device-only as well, and checked below by feeding it back in as an
 //            external operator, which is the form the product hands out.
 //     * cubin IN MEMORY                  (JITCompiler::getCubin)
@@ -45,7 +45,7 @@
 
 #include <cuda_runtime.h>
 
-#include <hostjit/compiler.hpp> // libnvcc.h + detail helpers
+#include <hostjit/compiler.hpp> // cudacc.h + detail helpers
 #include <hostjit/config.hpp>
 #include <hostjit/jit_compiler.hpp>
 
@@ -130,20 +130,20 @@ bool device_bitcode_to_file()
   auto config = hostjit::detectDefaultConfig();
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
-  auto opt_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::LibnvccProgramGuard prog;
-  if (libnvccCreateProgram(&prog.program, k_device_src, "scale.cu") != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard prog;
+  if (cudaccCreateProgram(&prog.program, k_device_src, "scale.cu") != CUDACC_SUCCESS)
   {
     std::fprintf(stderr, "  createProgram failed\n");
     return false;
   }
-  auto r = libnvccCompileProgramToDeviceBitcode(
+  auto r = cudaccCompileProgramToDeviceBitcode(
     prog.program, bc.c_str(), static_cast<int>(opt_ptrs.size()), opt_ptrs.empty() ? nullptr : opt_ptrs.data());
-  if (r != LIBNVCC_SUCCESS)
+  if (r != CUDACC_SUCCESS)
   {
     std::fprintf(
-      stderr, "  device-bitcode compile failed:\n%s\n", hostjit::detail::get_libnvcc_program_log(prog.program).c_str());
+      stderr, "  device-bitcode compile failed:\n%s\n", hostjit::detail::get_cudacc_program_log(prog.program).c_str());
     return false;
   }
 
@@ -199,20 +199,20 @@ bool device_ltoir_to_file()
   auto config = hostjit::detectDefaultConfig();
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
-  auto opt_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
-  hostjit::detail::LibnvccProgramGuard prog;
-  if (libnvccCreateProgram(&prog.program, k_op_src, "op.cu") != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard prog;
+  if (cudaccCreateProgram(&prog.program, k_op_src, "op.cu") != CUDACC_SUCCESS)
   {
     std::fprintf(stderr, "  createProgram failed\n");
     return false;
   }
-  auto r = libnvccCompileProgramToDeviceLTOIR(
+  auto r = cudaccCompileProgramToDeviceLTOIR(
     prog.program, ltoir.c_str(), static_cast<int>(opt_ptrs.size()), opt_ptrs.empty() ? nullptr : opt_ptrs.data());
-  if (r != LIBNVCC_SUCCESS)
+  if (r != CUDACC_SUCCESS)
   {
     std::fprintf(
-      stderr, "  LTO-IR compile failed:\n%s\n", hostjit::detail::get_libnvcc_program_log(prog.program).c_str());
+      stderr, "  LTO-IR compile failed:\n%s\n", hostjit::detail::get_cudacc_program_log(prog.program).c_str());
     return false;
   }
 

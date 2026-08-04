@@ -35,7 +35,7 @@
 
 #include <cuda_runtime.h>
 
-#include <hostjit/compiler.hpp> // libnvcc.h + detail helpers (LibnvccProgramGuard, option ptrs, log)
+#include <hostjit/compiler.hpp> // cudacc.h + detail helpers (CudaccProgramGuard, option ptrs, log)
 #include <hostjit/config.hpp>
 #include <hostjit/loader.hpp>
 
@@ -161,7 +161,7 @@ LinkOutcome build_link_run(
 
   std::vector<std::string> options;
   config.appendCommandLineArguments(options);
-  auto opt_ptrs = hostjit::detail::make_libnvcc_option_ptrs(options);
+  auto opt_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
   namespace fs = std::filesystem;
   fs::path dir = fs::temp_directory_path() / ("hostjit_multitu_" + std::to_string(std::random_device{}()));
@@ -172,22 +172,22 @@ LinkOutcome build_link_run(
   for (size_t i = 0; i < units.size(); ++i)
   {
     const std::string obj = (dir / (std::string("u") + std::to_string(i) + ".o")).string();
-    hostjit::detail::LibnvccProgramGuard prog;
-    if (libnvccCreateProgram(&prog.program, units[i].src, units[i].name) != LIBNVCC_SUCCESS)
+    hostjit::detail::CudaccProgramGuard prog;
+    if (cudaccCreateProgram(&prog.program, units[i].src, units[i].name) != CUDACC_SUCCESS)
     {
       std::fprintf(stderr, "  create program failed for %s\n", units[i].name);
       return LinkOutcome::SetupError;
     }
-    auto r = libnvccCompileProgramToObject(
+    auto r = cudaccCompileProgramToObject(
       prog.program,
       obj.c_str(),
       /*outputCubinPath*/ "",
       static_cast<int>(opt_ptrs.size()),
       opt_ptrs.empty() ? nullptr : opt_ptrs.data());
-    if (r != LIBNVCC_SUCCESS)
+    if (r != CUDACC_SUCCESS)
     {
       std::fprintf(
-        stderr, "  compile failed for %s:\n%s\n", units[i].name, hostjit::detail::get_libnvcc_program_log(prog.program).c_str());
+        stderr, "  compile failed for %s:\n%s\n", units[i].name, hostjit::detail::get_cudacc_program_log(prog.program).c_str());
       return LinkOutcome::SetupError;
     }
     objs.push_back(obj);
@@ -199,8 +199,8 @@ LinkOutcome build_link_run(
   const std::string lib = (dir / "libmultitu.so").string();
 #endif
 
-  hostjit::detail::LibnvccProgramGuard link_prog;
-  if (libnvccCreateProgram(&link_prog.program, "", "multitu-link") != LIBNVCC_SUCCESS)
+  hostjit::detail::CudaccProgramGuard link_prog;
+  if (cudaccCreateProgram(&link_prog.program, "", "multitu-link") != CUDACC_SUCCESS)
   {
     return LinkOutcome::SetupError;
   }
@@ -210,7 +210,7 @@ LinkOutcome build_link_run(
   {
     obj_ptrs.push_back(o.c_str());
   }
-  auto lr = libnvccLinkToSharedLibrary(
+  auto lr = cudaccLinkToSharedLibrary(
     link_prog.program,
     static_cast<int>(obj_ptrs.size()),
     obj_ptrs.data(),
@@ -218,10 +218,10 @@ LinkOutcome build_link_run(
     static_cast<int>(opt_ptrs.size()),
     opt_ptrs.empty() ? nullptr : opt_ptrs.data());
 
-  if (lr != LIBNVCC_SUCCESS)
+  if (lr != CUDACC_SUCCESS)
   {
     // Print a compact first line of the linker error for context.
-    std::string log = hostjit::detail::get_libnvcc_program_log(link_prog.program);
+    std::string log = hostjit::detail::get_cudacc_program_log(link_prog.program);
     std::printf("  link REJECTED: %.200s%s\n", log.c_str(), log.size() > 200 ? " ..." : "");
     return LinkOutcome::LinkFailed;
   }
