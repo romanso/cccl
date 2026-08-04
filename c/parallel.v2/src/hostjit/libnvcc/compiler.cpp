@@ -2059,6 +2059,12 @@ public:
       result.diagnostics += "\n=== nvJitLink + fatbinary ===\n";
     }
 
+    // Separate compilation: this TU's device code is finalized at the link, out
+    // of the sidecars, so the device link here is run only for a caller that
+    // asked for the cubin. Running it unconditionally would also reject a TU
+    // that calls a device function defined in another one, which is the whole
+    // point of relocatable device code.
+    if (!output_cubin_path.empty())
     {
       std::vector<char> ptx_data;
       {
