@@ -20,9 +20,11 @@
 //
 //   * Device code (external LLVM bitcode / LTO-IR) device-linked into one object.
 //   * Several *host* objects linked together into one shared library.
+//   * A device function defined in one object and called from another, which is
+//     what separate compilation is for: neither object is complete on its own.
 //
-// Both are exercised through ONE routine (build_link_run) with different inputs.
-// Expectation: both scenarios LINK and run their entry points.
+// All three are exercised through ONE routine (build_link_run) with different
+// inputs. Expectation: every scenario LINKS and runs its entry points.
 
 #include <cstdio>
 #include <filesystem>
@@ -109,6 +111,21 @@ const char* k_src_b = R"(
 
 __global__ void kernel_b(int* p, int v) { *p = v * 2; }
 extern "C" _CCCL_VISIBILITY_EXPORT void entry_b(int* p, int v) { kernel_b<<<1, 1>>>(p, v); }
+)";
+
+// A device function defined in one TU and called from another. Neither object
+// links on its own; the device symbol is resolved at the final device link.
+const char* k_src_provider = R"(
+extern "C" __device__ int scale(int x) { return x * 3; }
+)";
+
+const char* k_src_consumer = R"(
+#include <cuda_runtime.h>
+#include <cuda/std/version>
+
+extern "C" __device__ int scale(int);
+__global__ void kernel_scaled(int* p, int v) { *p = scale(v); }
+extern "C" _CCCL_VISIBILITY_EXPORT void entry_scaled(int* p, int v) { kernel_scaled<<<1, 1>>>(p, v); }
 )";
 
 bool write_file(const std::string& path, const char* text)
@@ -228,6 +245,10 @@ LinkOutcome build_link_run(
     }
     for (const auto& u : units)
     {
+      if (u.entry == nullptr)
+      {
+        continue; // a unit that only provides device code exports nothing
+      }
       auto fn = mod.getFunction<void (*)(int*, int)>(u.entry);
       if (!fn)
       {
@@ -290,14 +311,25 @@ int main()
   };
   const LinkOutcome multi_host_outcome = build_link_run("multi-host (2 host objs)", host_units, {});
 
+  // Scenario 3: one object defines a device function, another calls it. The
+  // caller's object cannot be finalized on its own, so this only links if the
+  // device code really is left relocatable until the final link.
+  const std::vector<HostUnit> cross_units = {
+    {"prov.cu", k_src_provider, nullptr, 0, 0},
+    {"use.cu", k_src_consumer, "entry_scaled", 14, 42},
+  };
+  const LinkOutcome cross_outcome = build_link_run("cross-object device call (2 host objs)", cross_units, {});
+
   const bool device_ok     = (device_outcome == LinkOutcome::Linked);
   const bool multi_host_ok = (multi_host_outcome == LinkOutcome::Linked);
+  const bool cross_ok      = (cross_outcome == LinkOutcome::Linked);
 
-  std::printf("\nresult: device-linking=%s (want LINKED), multi-host=%s (want LINKED)\n",
+  std::printf("\nresult: device-linking=%s, multi-host=%s, cross-object=%s (want LINKED)\n",
               to_str(device_outcome),
-              to_str(multi_host_outcome));
+              to_str(multi_host_outcome),
+              to_str(cross_outcome));
 
-  if (device_ok && multi_host_ok)
+  if (device_ok && multi_host_ok && cross_ok)
   {
     std::printf("multi-TU: PASS (device code and multiple host objects both link and run)\n");
     return 0;
