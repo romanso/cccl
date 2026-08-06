@@ -1792,11 +1792,7 @@ public:
     arg_strings.push_back("-fskip-odr-check-in-gmf");
     // RDC host codegen: defer device registration to the final link (one fatbin,
     // one registration object) instead of baking a fatbin into every object.
-    // -D__HOSTJIT_RDC__ makes the runtime wrapper emit its atexit-capture shim as
-    // weak/hidden so several host objects can be linked into one shared library
-    // without colliding.
     arg_strings.push_back("-fgpu-rdc");
-    arg_strings.push_back("-D__HOSTJIT_RDC__=1");
     arg_strings.push_back("-O" + std::to_string(config.optimization_level));
     arg_strings.push_back("-std=c++17");
 
