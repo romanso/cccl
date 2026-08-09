@@ -180,7 +180,9 @@ CompilerConfig detectDefaultConfig()
     if (cudaGetDeviceProperties(&prop, device) == cudaSuccess)
     {
       int detected_sm = prop.major * 10 + prop.minor;
-      if (detected_sm >= 75)
+      // Use the real device arch when available. Flooring at sm_75 left Pascal
+      // (e.g. MX150 / sm_61) compiling for Turing and returning wrong kernel results.
+      if (detected_sm >= 30)
       {
         config.sm_version = detected_sm;
       }

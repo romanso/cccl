@@ -76,6 +76,7 @@ LLD_HAS_DRIVER(elf)
 #include <unordered_map>
 #include <vector>
 
+#include <cuda_runtime_api.h>
 #include <nvFatbin.h>
 #include <nvJitLink.h>
 
@@ -1848,6 +1849,12 @@ public:
       return fail("nvJitLinkComplete failed");
     }
 
+#if CUDART_VERSION < 13000
+    // nvJitLinkGetLinkedLTOIR* is only available starting with CUDA 13.0.
+    nvJitLinkDestroy(&jitlink_handle);
+    result.diagnostics += "\nDevice LTOIR output requires CUDA Toolkit 13.0+";
+    return result;
+#else
     size_t ltoir_size = 0;
     jlr               = nvJitLinkGetLinkedLTOIRSize(jitlink_handle, &ltoir_size);
     if (jlr != NVJITLINK_SUCCESS || ltoir_size == 0)
@@ -1872,6 +1879,7 @@ public:
 
     result.success = true;
     return result;
+#endif
   }
 
   bool compileHostCode(

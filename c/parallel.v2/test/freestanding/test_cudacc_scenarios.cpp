@@ -33,11 +33,17 @@
 namespace
 {
 // A kernel with a host entry point that launches it. Every scenario that ends
-// in a shared library exports 'run'.
+// in a shared library exports 'run'. On Windows PE, visibility("default") does
+// not export; use dllexport there (same idea as _CCCL_VISIBILITY_EXPORT).
 const char* k_lib_src = R"cu(
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#  define CUDACC_TEST_EXPORT __declspec(dllexport)
+#else
+#  define CUDACC_TEST_EXPORT __attribute__((visibility("default")))
+#endif
 __global__ void k(int* p, int v) { *p = v + 1; }
-extern "C" __attribute__((visibility("default"))) void run(int* p, int v) { k<<<1, 1>>>(p, v); }
+extern "C" CUDACC_TEST_EXPORT void run(int* p, int v) { k<<<1, 1>>>(p, v); }
 )cu";
 
 // Scenario 2: an operator compiled on its own, standing in for one NVRTC hands
@@ -48,9 +54,14 @@ extern "C" __device__ int op(int x) { return x * x; }
 
 const char* k_caller_src = R"cu(
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#  define CUDACC_TEST_EXPORT __declspec(dllexport)
+#else
+#  define CUDACC_TEST_EXPORT __attribute__((visibility("default")))
+#endif
 extern "C" __device__ int op(int);   // resolved by the external LTO-IR
 __global__ void k(int* p, int v) { *p = op(v); }
-extern "C" __attribute__((visibility("default"))) void run(int* p, int v) { k<<<1, 1>>>(p, v); }
+extern "C" CUDACC_TEST_EXPORT void run(int* p, int v) { k<<<1, 1>>>(p, v); }
 )cu";
 
 // Scenario 3: two sources, the second calling a device function from the first.
@@ -60,9 +71,14 @@ extern "C" __device__ int scale(int x) { return x * 3; }
 
 const char* k_b_src = R"cu(
 #include <cuda_runtime.h>
+#if defined(_WIN32)
+#  define CUDACC_TEST_EXPORT __declspec(dllexport)
+#else
+#  define CUDACC_TEST_EXPORT __attribute__((visibility("default")))
+#endif
 extern "C" __device__ int scale(int);
 __global__ void k(int* p, int v) { *p = scale(v); }
-extern "C" __attribute__((visibility("default"))) void run(int* p, int v) { k<<<1, 1>>>(p, v); }
+extern "C" CUDACC_TEST_EXPORT void run(int* p, int v) { k<<<1, 1>>>(p, v); }
 )cu";
 
 std::vector<std::string> base_options()
@@ -152,6 +168,12 @@ bool scenario_external_operator(const std::filesystem::path& dir)
 {
   std::printf("[2] source + external operator (in memory) -> shared library\n");
 
+  // Device LTO-IR extract (nvJitLink -r / GetLinkedLTOIR) needs CUDA Toolkit 13+.
+#if CUDART_VERSION < 13000
+  (void) dir;
+  std::printf("  skipped: external-operator LTO-IR path requires CUDA Toolkit 13.0+\n");
+  return true;
+#else
   // The operator, compiled on its own to LTO-IR. Nothing writes it out.
   std::vector<char> operator_ltoir;
   {
@@ -207,6 +229,7 @@ bool scenario_external_operator(const std::filesystem::path& dir)
     return false;
   }
   return load_and_run(library, 7, 49);
+#endif
 }
 
 // 3 -- two sources, each compiled to an object, linked together.
@@ -281,7 +304,13 @@ bool scenario_device_artifact()
     const char* option;
     const char* label;
   };
-  const Request requests[] = {{"--ltoir", "LTO-IR"}, {"--cubin", "cubin"}, {"--bitcode", "bitcode"}};
+  const Request requests[] = {
+#if CUDART_VERSION >= 13000
+    {"--ltoir", "LTO-IR"},
+#endif
+    {"--cubin", "cubin"},
+    {"--bitcode", "bitcode"},
+  };
 
   for (const auto& request : requests)
   {
@@ -319,7 +348,9 @@ bool log_survives_failure()
   const std::string source = "__global__ void k(int* p) { *p = nosuchthing; }";
 
   auto options = base_options();
-  options.emplace_back("--ltoir");
+  // Prefer bitcode so the negative test exercises the FE on CUDA 12 as well:
+  // --ltoir needs Toolkit 13+ (nvJitLink -r / GetLinkedLTOIR).
+  options.emplace_back("--bitcode");
   options.emplace_back("bad.cu");
   auto option_ptrs = hostjit::detail::make_cudacc_option_ptrs(options);
 
