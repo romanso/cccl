@@ -22,35 +22,6 @@ namespace hostjit
 #ifdef _WIN32
 namespace
 {
-// Run C++ static constructors in a DLL loaded with /NOENTRY /NODEFAULTLIB.
-// The compiler places CUDA fatbin registration in the .CRT$XCU section.
-// Without CRT startup, these never run, so we walk the merged .CRT section
-// in the PE and call each non-null function pointer.
-void runStaticInitializers(HMODULE module)
-{
-  auto base = reinterpret_cast<const unsigned char*>(module);
-  auto dos  = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
-  auto nt   = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-  auto sec  = IMAGE_FIRST_SECTION(nt);
-
-  for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++sec)
-  {
-    if (memcmp(sec->Name, ".CRT", 4) == 0)
-    {
-      using InitFunc = void(__cdecl*)();
-      auto funcs     = reinterpret_cast<InitFunc*>(const_cast<unsigned char*>(base) + sec->VirtualAddress);
-      size_t count   = sec->SizeOfRawData / sizeof(InitFunc);
-      for (size_t j = 0; j < count; ++j)
-      {
-        if (funcs[j])
-        {
-          funcs[j]();
-        }
-      }
-    }
-  }
-}
-
 // GetProcAddress on a loaded DLL only searches that module's own export table,
 // not the DLLs it imports. The JIT module imports cudaDeviceSynchronize from
 // cudart, so resolve it from cudart (already loaded in-process) by scanning all
@@ -174,10 +145,9 @@ bool DynamicLibrary::load(const std::string& library_path)
     }
     return false;
   }
-
-  // The DLL is linked with /NOENTRY (no CRT startup), so C++ static
-  // constructors (e.g. CUDA fatbin registration) haven't run yet.
-  runStaticInitializers(static_cast<HMODULE>(handle_));
+  // The DLL names its own entry point, so LoadLibrary has already run the static
+  // constructors and the fatbin is registered. This used to be done here, for a
+  // /NOENTRY DLL that had no entry point to run them.
 #else
   dlerror();
   handle_ = dlopen(library_path.c_str(), RTLD_LAZY | RTLD_LOCAL);

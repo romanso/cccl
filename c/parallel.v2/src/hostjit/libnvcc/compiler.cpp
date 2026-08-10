@@ -2060,7 +2060,12 @@ public:
 #ifdef _WIN32
     arg_strings.push_back("lld-link");
     arg_strings.push_back("/DLL");
-    arg_strings.push_back("/NOENTRY");
+    // The DLL carries its own entry point (see __clang_cuda_runtime_wrapper.h):
+    // it runs the static constructors on attach, which is what registers the
+    // fatbin, and unregisters it on detach. Without one -- /NOENTRY, as this used
+    // to be -- neither happens, and the library only works for a caller that
+    // knows to drive both by hand.
+    arg_strings.push_back("/ENTRY:hostjit_dll_entry");
     arg_strings.push_back("/NODEFAULTLIB");
     arg_strings.push_back("/OUT:" + output_path);
 
