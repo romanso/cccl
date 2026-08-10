@@ -29,6 +29,10 @@
 //
 //  3. CUDA still works afterwards. A module unmapped while still registered
 //     leaves the runtime holding a pointer into freed memory.
+//
+//  4. Two holders of one artifact do not interfere: closing one leaves the other
+//     one working, since the image is unregistered by the OS reference count
+//     rather than by whoever closes first.
 
 #include <cstdio>
 #include <cstdlib>
@@ -189,6 +193,61 @@ static bool run_cycle(const std::string& path, int* d_ptr, int expected)
   return true;
 }
 
+// Two holders of one artifact. Opening the same file twice returns the same
+// mapping with a bumped reference count and does not re-run the constructors, so
+// the fatbin is registered once, and the OS runs the finalizer only when the last
+// handle goes. Closing one holder must therefore leave the other one working.
+static bool survives_a_second_holder(const std::string& path, int* d_ptr)
+{
+#if defined(_WIN32)
+  HMODULE first  = LoadLibraryA(path.c_str());
+  HMODULE second = LoadLibraryA(path.c_str());
+#else
+  void* first  = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+  void* second = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+#endif
+  if (!first || !second)
+  {
+    std::fprintf(stderr, "artifact-unload: could not open the artifact twice\n");
+    return false;
+  }
+
+  using host_entry_fn = void (*)(int*, int);
+#if defined(_WIN32)
+  auto host_fn = reinterpret_cast<host_entry_fn>(reinterpret_cast<void*>(GetProcAddress(second, "host_entry")));
+#else
+  auto host_fn = reinterpret_cast<host_entry_fn>(dlsym(second, "host_entry"));
+#endif
+
+#if defined(_WIN32)
+  FreeLibrary(first);
+#else
+  dlclose(first);
+#endif
+
+  // Through the handle that is still open, after the other one is gone.
+  int result = -1;
+  host_fn(d_ptr, 7);
+  cudaError_t e = cudaDeviceSynchronize();
+  cudaMemcpy(&result, d_ptr, sizeof(int), cudaMemcpyDeviceToHost);
+
+#if defined(_WIN32)
+  FreeLibrary(second);
+#else
+  dlclose(second);
+#endif
+
+  if (e != cudaSuccess || result != 7)
+  {
+    std::fprintf(stderr,
+                 "artifact-unload: closing one holder broke the other: got %d, want 7, %s\n",
+                 result,
+                 cudaGetErrorString(e));
+    return false;
+  }
+  return true;
+}
+
 int main()
 {
   std::error_code ec;
@@ -246,6 +305,14 @@ int main()
     }
     cudaMemGetInfo(&free_bytes, &total);
     std::printf("artifact-unload: cycle %d ok, %zu byte(s) free\n", i, free_bytes);
+  }
+
+  if (rc == 0)
+  {
+    rc = survives_a_second_holder(path, d_ptr) ? 0 : 1;
+    cudaDeviceSynchronize();
+    cudaMemGetInfo(&free_bytes, &total);
+    std::printf("artifact-unload: two holders ok, %zu byte(s) free\n", free_bytes);
   }
 
   cudaFree(d_ptr);

@@ -19,11 +19,11 @@
 // When that counting arrives, this test fails and says so, instead of the change
 // going unnoticed.
 //
-// Linux only. On Windows the produced DLL has no CRT startup, so the loader runs
-// the static initializers itself; a second load of the same path hands back the
-// same image and runs them again, which registers the fatbin twice and overflows
-// the single-slot capture table. The probe would take the process down rather
-// than report anything.
+// Both platforms behave the same way here. This used to be a Linux-only probe:
+// the produced DLL had no entry point, so the loader ran the static initializers
+// itself and a second load of the same path ran them again, registering the
+// fatbin twice and overflowing the capture table. The DLL now carries its own
+// entry point and the OS runs the initializers on the first load only.
 
 #include <cstdio>
 #include <filesystem>
@@ -35,7 +35,6 @@
 #include <hostjit/jit_compiler.hpp>
 #include <hostjit/loader.hpp>
 
-#ifndef _WIN32
 namespace
 {
 const char* k_source = R"(
@@ -125,16 +124,11 @@ bool probe_shared_image(const std::string& module_path, int* d_ptr)
   return as_documented;
 }
 } // namespace
-#endif // !_WIN32
 
 int main()
 {
   std::printf("unload-shared-image -- one module image held by two handles\n");
 
-#ifdef _WIN32
-  std::printf("  skipped: a second load re-runs the module ctor on Windows\n");
-  return 0;
-#else
   auto config = hostjit::detectDefaultConfig();
 
   int* d_ptr = nullptr;
@@ -156,5 +150,4 @@ int main()
 
   std::printf("unload-shared-image: %s\n", ok ? "PASS" : "FAIL");
   return ok ? 0 : 1;
-#endif
 }
