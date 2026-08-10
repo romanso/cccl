@@ -418,20 +418,83 @@ extern "C" unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, siz
 
 // The JIT shared library is linked without the C runtime (no libc on the link
 // line) so atexit is unavailable.  The CUDA module constructor calls atexit()
-// to register a cleanup function.  Provide a no-op stub — the JIT library is
-// short-lived and unloaded explicitly.
+// to register __cuda_module_dtor, which calls __cudaUnregisterFatBinary.  We
+// cannot defer to process exit (no CRT), so instead of discarding the callback
+// (the old no-op stub) we record it in an exported, per-module table.  The
+// host-JIT loader looks this table up and runs the destructors at a controlled
+// unload time, unregistering the fatbin before the module is released.
 #  if !defined(__HOSTJIT_DEVICE_COMPILATION__)
-#    if defined(_MSC_VER)
-extern "C" int atexit(void(__cdecl*)(void))
+extern "C"
 {
-  return 0;
-}
+#    if defined(_WIN32)
+#      define __HOSTJIT_EXPORT __declspec(dllexport)
 #    else
-extern "C" int atexit(void (*)(void))
-{
-  return 0;
-}
+#      define __HOSTJIT_EXPORT __attribute__((visibility("default")))
 #    endif
+
+// Every host TU force-includes this header, so the shim is emitted once per TU while
+// the linked library has to end up with a single copy of it. These attributes make
+// the per-TU copies merge instead of colliding.
+//   * Linux/ELF: weak; atexit is additionally hidden so the registration object's
+//     atexit() call binds to this shim locally and cannot be taken over by another
+//     atexit in the process, which would defer the dtor to process exit and bring
+//     back the dangling-fatbin crash the unload logic prevents.
+//   * Windows/COFF: selectany merges the exported table across objects and the
+//     atexit function merges via a weak comdat. COFF has no cross-DLL symbol
+//     interposition, so no hidden-visibility equivalent is needed.
+// A strong atexit reaching the link from elsewhere would win over the weak
+// definition and disable the capture silently. The link contains only objects the
+// compiler generated itself plus cudart, so there is none.
+#    if defined(_WIN32)
+#      define __HOSTJIT_TABLE_ATTR  __declspec(selectany) __HOSTJIT_EXPORT
+#      define __HOSTJIT_ATEXIT_ATTR __attribute__((weak))
+#    else
+#      define __HOSTJIT_TABLE_ATTR  __attribute__((weak)) __HOSTJIT_EXPORT
+#      define __HOSTJIT_ATEXIT_ATTR __attribute__((weak, visibility("hidden")))
+#    endif
+
+#    if defined(_MSC_VER)
+  typedef void(__cdecl* __hostjit_atexit_fn)(void);
+#    else
+  typedef void (*__hostjit_atexit_fn)(void);
+#    endif
+
+  // The library carries one fatbin and one registration constructor, and that
+  // constructor schedules exactly one atexit(__cuda_module_dtor), so capacity 1 is
+  // enough and the merged table holds that single callback. Overflow means more than
+  // one registration constructor reached the shim -- an invariant violation -- so
+  // fail loudly instead of silently dropping an unregister, which would reintroduce
+  // the dangling-fatbin crash the unload logic exists to prevent.
+  enum
+  {
+    __hostjit_max_atexit = 1
+  };
+
+  // Exported so hostjit's DynamicLibrary::unload() can find and replay them.
+  __HOSTJIT_TABLE_ATTR __hostjit_atexit_fn hostjit_module_atexit_funcs[__hostjit_max_atexit] = {0};
+  __HOSTJIT_TABLE_ATTR int hostjit_module_atexit_count                                       = 0;
+
+  __HOSTJIT_ATEXIT_ATTR int atexit(__hostjit_atexit_fn func)
+  {
+    if (!func)
+    {
+      return 0;
+    }
+    if (hostjit_module_atexit_count >= __hostjit_max_atexit)
+    {
+      // More module dtors than the unload mechanism can capture (see the note above).
+      __builtin_trap();
+    }
+    hostjit_module_atexit_funcs[hostjit_module_atexit_count++] = func;
+    return 0;
+  }
+} // extern "C"
+
+// This header is force-included into every host TU, so leave the user's macro
+// namespace as it was found.
+#    undef __HOSTJIT_EXPORT
+#    undef __HOSTJIT_TABLE_ATTR
+#    undef __HOSTJIT_ATEXIT_ATTR
 #  endif
 
 #endif // __CUDA__ && __clang__
