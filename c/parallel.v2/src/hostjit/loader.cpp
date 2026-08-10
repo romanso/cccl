@@ -73,7 +73,14 @@ void* resolveFromLoadedModules(const char* name)
   {
     return nullptr;
   }
-  const int n = static_cast<int>(needed / sizeof(HMODULE));
+  // needed reports what the full list would take, not what was written: the call
+  // succeeds with a truncated list when the process has more modules than fit.
+  const int capacity = static_cast<int>(sizeof(mods) / sizeof(mods[0]));
+  int n              = static_cast<int>(needed / sizeof(HMODULE));
+  if (n > capacity)
+  {
+    n = capacity;
+  }
   for (int i = 0; i < n; ++i)
   {
     if (auto* s = reinterpret_cast<void*>(GetProcAddress(mods[i], name)))

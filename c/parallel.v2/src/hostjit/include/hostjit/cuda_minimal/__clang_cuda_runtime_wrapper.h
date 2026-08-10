@@ -495,6 +495,12 @@ extern "C"
     return 0;
   }
 } // extern "C"
+
+// This header is force-included into every host TU, so leave the user's macro
+// namespace as it was found.
+#    undef __HOSTJIT_EXPORT
+#    undef __HOSTJIT_TABLE_ATTR
+#    undef __HOSTJIT_ATEXIT_ATTR
 #  endif
 
 #endif // __CUDA__ && __clang__
