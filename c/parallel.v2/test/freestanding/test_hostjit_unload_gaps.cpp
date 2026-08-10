@@ -15,6 +15,8 @@
 // straight path suggests. Both record what happens today, so a change in either
 // direction shows up as a test result rather than as a surprise in the field.
 //
+// The first probe runs on Linux only; the reason is in main().
+//
 //   1. One module image, two handles. Loading the same library twice gives two
 //      handles to ONE mapped image, and the fatbin-unregister callbacks live in
 //      that image, shared. Unloading one handle therefore unregisters the fatbin
@@ -34,7 +36,11 @@
 #include <filesystem>
 #include <string>
 
-#include <dlfcn.h>
+#ifdef _WIN32
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#endif
 
 #include <cuda_runtime.h>
 
@@ -64,8 +70,9 @@ extern "C" _CCCL_VISIBILITY_EXPORT void host_entry(int* ptr, int v)
 }
 )";
 
-// Build the module and keep the .so on disk, so the probes can open it directly.
-bool build_module(hostjit::CompilerConfig config, std::string& so_path)
+#ifndef _WIN32
+// Build the module and keep it on disk, so the probe can open it directly.
+bool build_module(hostjit::CompilerConfig config, std::string& module_path)
 {
   config.enable_pch      = false;
   config.keep_artifacts  = true;
@@ -76,8 +83,8 @@ bool build_module(hostjit::CompilerConfig config, std::string& so_path)
     std::fprintf(stderr, "  compile failed: %s\n", compiler.getLastError().c_str());
     return false;
   }
-  so_path = compiler.getArtifactsPath() + "/libcuda_code.so";
-  return std::filesystem::exists(so_path);
+  module_path = compiler.getLoadedModulePath();
+  return !module_path.empty() && std::filesystem::exists(module_path);
 }
 
 // Launch through one handle and report the outcome instead of asserting it:
@@ -137,6 +144,7 @@ bool probe_shared_image(const std::string& so_path, int* d_ptr)
   }
   return as_documented;
 }
+#endif // !_WIN32
 
 // 2. Free device memory as the driver sees it. The driver API does not go
 //    through CUDART's pending-unload queue, so it shows the state before the
@@ -145,12 +153,21 @@ using CuMemGetInfoFn = int (*)(size_t*, size_t*);
 
 CuMemGetInfoFn load_driver_mem_get_info()
 {
+#ifdef _WIN32
+  HMODULE libcuda = LoadLibraryA("nvcuda.dll");
+  if (!libcuda)
+  {
+    return nullptr;
+  }
+  return reinterpret_cast<CuMemGetInfoFn>(GetProcAddress(libcuda, "cuMemGetInfo_v2"));
+#else
   void* libcuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
   if (!libcuda)
   {
     return nullptr;
   }
   return reinterpret_cast<CuMemGetInfoFn>(dlsym(libcuda, "cuMemGetInfo_v2"));
+#endif
 }
 
 bool probe_unload_window(hostjit::CompilerConfig config, int* d_ptr)
@@ -233,15 +250,27 @@ int main()
     return 2;
   }
 
-  std::string so_path;
-  if (!build_module(config, so_path))
+  bool ok = true;
+
+#ifdef _WIN32
+  // Windows runs the second probe only. The DLL has no CRT startup, so load()
+  // runs the static initializers itself; loading the same path twice hands back
+  // the same image and runs them again, registering the fatbin a second time and
+  // overflowing the single-slot capture table. The probe would trap rather than
+  // report, so on Windows the shared-image question stays where the CFE-104
+  // write-up leaves it -- open.
+  std::printf("[one image, two handles] skipped: a second load re-runs the module ctor on Windows\n");
+#else
+  std::string module_path;
+  if (!build_module(config, module_path))
   {
     cudaFree(d_ptr);
     return 2;
   }
 
   std::printf("[one image, two handles]\n");
-  bool ok = probe_shared_image(so_path, d_ptr);
+  ok &= probe_shared_image(module_path, d_ptr);
+#endif
 
   std::printf("[window between unload and the driver letting go]\n");
   ok &= probe_unload_window(config, d_ptr);
