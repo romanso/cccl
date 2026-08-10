@@ -289,7 +289,10 @@ void DynamicLibrary::unload()
     // driver call from its next entry point, so without this the module would
     // stay resident on the device for as long as the process makes no CUDA call.
     // One more runtime call, made while the module is still mapped, drains that
-    // queue and gives the device state back at unload time.
+    // queue and gives the device state back at unload time. Nothing public says
+    // when the runtime issues that driver call or how to force it, so this rests
+    // on measured behaviour; a CUDART entry point that flushed the queue would
+    // make the sequence a supported one and save the second full-device sync.
     sync();
 
     // The fatbin is unregistered, so it is now safe to unmap the module.
