@@ -2726,13 +2726,13 @@ public:
       return false;
     }
 
-#ifdef _WIN32
     // CUDA 13's cudart no longer exports __cudaRegisterSurface / __cudaRegisterTexture
     // (legacy texture/surface references). wrapCudaBinary still emits calls to them,
     // but JIT'd CUB kernels never register textures or surfaces, so those calls are
-    // never reached at runtime. Give the declarations a local no-op body so the
-    // Windows DLL links and loads -- otherwise the loader fails with
-    // "The specified procedure could not be found" on the missing cudart imports.
+    // never reached at runtime. Give the declarations a local no-op body, on every
+    // platform: Windows fails the load outright, and while an ELF image with a lazy
+    // binding gets away with an unresolved call nobody makes, a caller that opens it
+    // with RTLD_NOW does not.
     for (const char* sym : {"__cudaRegisterSurface", "__cudaRegisterTexture"})
     {
       if (auto* f = regM.getFunction(sym); f && f->isDeclaration())
@@ -2741,7 +2741,6 @@ public:
         llvm::ReturnInst::Create(ctx, llvm::BasicBlock::Create(ctx, "entry", f));
       }
     }
-#endif
 
     // 5) Emit the registration module to a host object for the final link.
     out_reg_obj = output_path + ".rdcreg.o";
@@ -2801,7 +2800,12 @@ public:
 #ifdef _WIN32
     arg_strings.push_back("lld-link");
     arg_strings.push_back("/DLL");
-    arg_strings.push_back("/NOENTRY");
+    // The DLL carries its own entry point (see __clang_cuda_runtime_wrapper.h):
+    // it runs the static constructors on attach, which is what registers the
+    // fatbin, and unregisters it on detach. Without one -- /NOENTRY, as this used
+    // to be -- neither happens, and the library only works for a caller that
+    // knows to drive both by hand.
+    arg_strings.push_back("/ENTRY:hostjit_dll_entry");
     arg_strings.push_back("/NODEFAULTLIB");
     arg_strings.push_back("/OUT:" + output_path);
 

@@ -4,6 +4,9 @@
 
 namespace hostjit
 {
+// Holds one JIT-compiled CUDA module. Not a general-purpose dynamic-library
+// wrapper: unload() drives the module's CUDA teardown and requires the library
+// to link cudart, and it aborts rather than unmap a module it cannot drain.
 class DynamicLibrary
 {
 public:

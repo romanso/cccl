@@ -35,6 +35,12 @@
 //     back to the baseline after the unload. Without the ballast the difference
 //     stays below what the driver reports and the check proves nothing.
 //
+//  4. And nothing left registered even for a while. Check #3 samples after a
+//     sync, so it cannot see a module that is released only because the runtime
+//     was called again. This one reads free memory through the DRIVER API, which
+//     does not drain the queue, right after an unload and with no runtime call in
+//     between: the device state has to be back by the time unload() returns.
+//
 // (Skipping unload entirely would pass #1 but fail #2; unloading without proper
 // unregister/drain would pass #2 but fail #1 -- so both checks are needed.)
 //
@@ -59,8 +65,11 @@
 #  include <windows.h>
 
 #  include <psapi.h>
-#elif defined(__linux__)
-#  include <set>
+#else
+#  include <dlfcn.h>
+#  if defined(__linux__)
+#    include <set>
+#  endif
 #endif
 
 static const char* k_source = R"(
@@ -174,6 +183,91 @@ static int count_mapped(const std::string&)
 }
 #endif
 
+// Free device memory as the driver sees it. Unlike cudaMemGetInfo, a driver call
+// does not run CUDART's pending-unload queue, so it shows the state as it stands
+// right after the unload rather than the state a runtime call would create.
+using CuMemGetInfoFn = int (*)(size_t*, size_t*);
+
+static CuMemGetInfoFn load_driver_mem_get_info()
+{
+#if defined(_WIN32)
+  HMODULE libcuda = LoadLibraryA("nvcuda.dll");
+  if (!libcuda)
+  {
+    return nullptr;
+  }
+  return reinterpret_cast<CuMemGetInfoFn>(GetProcAddress(libcuda, "cuMemGetInfo_v2"));
+#else
+  void* libcuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+  if (!libcuda)
+  {
+    return nullptr;
+  }
+  return reinterpret_cast<CuMemGetInfoFn>(dlsym(libcuda, "cuMemGetInfo_v2"));
+#endif
+}
+
+// Check (4): load, launch, unload, and read the driver's view of free memory
+// without touching the runtime in between.
+static bool no_unload_window(hostjit::CompilerConfig config, int* d_ptr)
+{
+  CuMemGetInfoFn cu_mem_get_info = load_driver_mem_get_info();
+  if (!cu_mem_get_info)
+  {
+    std::printf("unload: window check skipped (driver API unavailable)\n");
+    return true;
+  }
+
+  size_t total = 0, resident = 0, after_unload = 0, after_runtime_call = 0;
+  {
+    config.enable_pch = false;
+    hostjit::JITCompiler compiler(config);
+    if (!compiler.compile(k_source))
+    {
+      std::fprintf(stderr, "unload: window check compile failed:\n%s\n", compiler.getLastError().c_str());
+      return false;
+    }
+    auto host_fn = compiler.getFunction<void (*)(int*, int)>("host_entry");
+    if (!host_fn)
+    {
+      std::fprintf(stderr, "unload: window check: 'host_entry' not found\n");
+      return false;
+    }
+    host_fn(d_ptr, 7);
+    if (cudaDeviceSynchronize() != cudaSuccess)
+    {
+      std::fprintf(stderr, "unload: window check launch failed\n");
+      return false;
+    }
+    cu_mem_get_info(&resident, &total);
+    // `compiler` goes out of scope here -> unload().
+  }
+  cu_mem_get_info(&after_unload, &total);
+
+  size_t runtime_free = 0, runtime_total = 0;
+  cudaMemGetInfo(&runtime_free, &runtime_total); // a runtime entry point: drains the queue
+  cu_mem_get_info(&after_runtime_call, &total);
+
+  const long long held = static_cast<long long>(after_runtime_call) - static_cast<long long>(after_unload);
+  std::printf("unload: free memory resident %zu, after unload %zu, after a runtime call %zu\n",
+              resident,
+              after_unload,
+              after_runtime_call);
+
+  if (after_runtime_call < resident)
+  {
+    std::fprintf(stderr, "unload: the module's memory never came back -- that is a leak, not a window\n");
+    return false;
+  }
+  if (held > 0)
+  {
+    std::fprintf(stderr, "unload: %lld byte(s) held until the next runtime call -- the unload does not flush\n", held);
+    return false;
+  }
+  std::printf("unload: no window -- the device state is back when unload() returns\n");
+  return true;
+}
+
 int main()
 {
   auto config = hostjit::detectDefaultConfig();
@@ -253,6 +347,13 @@ int main()
       free_after[i] = free_bytes;
     }
     std::printf("unload: iter %d ok (result=%d) after unload\n", i, expected);
+  }
+
+  // (4) No window: an unload must give the device state back on its own, without
+  // waiting for the next runtime call.
+  if (rc == 0 && !no_unload_window(config, d_ptr))
+  {
+    rc = 1;
   }
 
   cudaFree(d_ptr);
