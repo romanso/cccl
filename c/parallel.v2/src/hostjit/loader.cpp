@@ -248,12 +248,11 @@ void DynamicLibrary::unload()
       sync();
     }
 
-    // Clang's fatbin embedding (-fcuda-include-gpubinary) emits a module ctor that
-    // registers the fatbin and schedules __cudaUnregisterFatBinary via atexit. This
-    // freestanding module has no C-runtime atexit, so the wrapper records those
-    // callbacks in an exported table (see __clang_cuda_runtime_wrapper.h); run them
-    // here to unregister the fatbin while the module is still mapped.
-    runCapturedAtexitCallbacks();
+    // The module unregisters its fatbin on its own when the OS unloads it, but we
+    // want that done while it is still mapped, so that the flush below can give the
+    // device state back at unload time. The module exports __cudacc_module_fini()
+    // for exactly this; it is one-shot, so the OS hook afterwards finds nothing to do.
+    runModuleFini();
 
     // Unregistering only queues the module for unload; the runtime issues the
     // driver call from its next entry point, so without this the module would
@@ -296,7 +295,7 @@ std::string DynamicLibrary::getLoadedModulePath() const
 #endif
 }
 
-void DynamicLibrary::runCapturedAtexitCallbacks()
+void DynamicLibrary::runModuleFini()
 {
   if (!handle_)
   {
@@ -304,25 +303,15 @@ void DynamicLibrary::runCapturedAtexitCallbacks()
   }
 
 #ifdef _WIN32
-  auto mod   = static_cast<HMODULE>(handle_);
-  auto count = reinterpret_cast<int*>(GetProcAddress(mod, "hostjit_module_atexit_count"));
-  auto funcs = reinterpret_cast<void(__cdecl**)(void)>(GetProcAddress(mod, "hostjit_module_atexit_funcs"));
+  auto proc = GetProcAddress(static_cast<HMODULE>(handle_), "__cudacc_module_fini");
+  auto fini = reinterpret_cast<void(__cdecl*)(void)>(proc);
 #else
-  auto count = reinterpret_cast<int*>(dlsym(handle_, "hostjit_module_atexit_count"));
-  auto funcs = reinterpret_cast<void (**)(void)>(dlsym(handle_, "hostjit_module_atexit_funcs"));
+  auto fini = reinterpret_cast<void (*)(void)>(dlsym(handle_, "__cudacc_module_fini"));
 #endif
 
-  if (count && funcs)
+  if (fini)
   {
-    // Run in reverse registration order, like a real atexit() chain.
-    for (int i = *count - 1; i >= 0; --i)
-    {
-      if (funcs[i])
-      {
-        funcs[i]();
-      }
-    }
-    *count = 0;
+    fini();
   }
 }
 } // namespace hostjit

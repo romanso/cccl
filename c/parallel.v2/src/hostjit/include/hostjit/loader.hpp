@@ -50,9 +50,9 @@ public:
   std::string getLoadedModulePath() const;
 
 private:
-  // Run the atexit callbacks the JIT module captured in its exported table
-  // (these unregister the module's fatbin). See unload().
-  void runCapturedAtexitCallbacks();
+  // Ask the module to tear itself down (this unregisters its fatbin), earlier than
+  // the OS would do it on unmap. See unload().
+  void runModuleFini();
 
   void* handle_;
   std::string last_error_;

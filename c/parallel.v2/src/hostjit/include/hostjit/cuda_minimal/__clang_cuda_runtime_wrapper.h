@@ -430,10 +430,11 @@ extern "C" unsigned __cudaPushCallConfiguration(dim3 gridDim, dim3 blockDim, siz
 // entirely -- closes it the ordinary way and the fatbin is unregistered before the
 // image goes away.
 //
-// The table stays exported because the host-JIT loader still runs it from outside,
-// earlier than the OS would, so that it can flush the runtime's pending unload
-// while the module is mapped.  Draining the table is one-shot, so running it from
-// both places unregisters once.
+// A loader that wants the teardown to happen earlier than the OS would run it --
+// so that it can flush the runtime's pending unload while the module is still
+// mapped -- calls __cudacc_module_fini(), the one symbol the image exports for
+// this.  The table behind it is internal: draining is one-shot, so the early call
+// and the OS hook together still unregister exactly once.
 #  if !defined(__HOSTJIT_DEVICE_COMPILATION__)
 extern "C"
 {
@@ -446,26 +447,28 @@ extern "C"
 // Every host TU force-includes this header, so the shim is emitted once per TU while
 // the linked library has to end up with a single copy of it. These attributes make
 // the per-TU copies merge instead of colliding.
-//   * Linux/ELF: weak; atexit is additionally hidden so the registration object's
-//     atexit() call binds to this shim locally and cannot be taken over by another
-//     atexit in the process, which would defer the dtor to process exit and bring
-//     back the dangling-fatbin crash the unload logic prevents.
-//   * Windows/COFF: selectany merges the exported table across objects, and the
-//     functions are inline, which puts each copy in a comdat the linker folds.
-//     Weak does not work here: lld-link reports a duplicate symbol as soon as a
-//     second object defines one. `used` keeps the copies from being dropped
-//     before the fold, which matters for the entry point, since nothing inside
-//     the image calls it. COFF has no cross-DLL symbol interposition, so no
-//     hidden-visibility equivalent is needed.
+//   * Linux/ELF: weak; everything except the finalizer is also hidden, both to keep
+//     it out of the image's interface and so that the registration object's atexit()
+//     call binds to this shim locally and cannot be taken over by another atexit in
+//     the process, which would defer the dtor to process exit and bring back the
+//     dangling-fatbin crash the unload logic prevents.
+//   * Windows/COFF: selectany merges the table across objects, and the functions are
+//     inline, which puts each copy in a comdat the linker folds. Weak does not work
+//     here: lld-link reports a duplicate symbol as soon as a second object defines
+//     one. `used` keeps the copies from being dropped before the fold, which matters
+//     for the entry point, since nothing inside the image calls it. COFF has no
+//     cross-DLL symbol interposition, so no hidden-visibility equivalent is needed.
 // On ELF a strong atexit reaching the link from elsewhere would win over the weak
 // definition and disable the capture silently. The link contains only objects the
 // compiler generated itself plus cudart, so there is none.
 #    if defined(_WIN32)
-#      define __HOSTJIT_TABLE_ATTR  __declspec(selectany) __HOSTJIT_EXPORT
+#      define __HOSTJIT_TABLE_ATTR  __declspec(selectany)
 #      define __HOSTJIT_ATEXIT_ATTR inline __attribute__((used))
+#      define __HOSTJIT_FINI_ATTR   inline __attribute__((used)) __HOSTJIT_EXPORT
 #    else
-#      define __HOSTJIT_TABLE_ATTR  __attribute__((weak)) __HOSTJIT_EXPORT
+#      define __HOSTJIT_TABLE_ATTR  __attribute__((weak, visibility("hidden")))
 #      define __HOSTJIT_ATEXIT_ATTR __attribute__((weak, visibility("hidden")))
+#      define __HOSTJIT_FINI_ATTR   __attribute__((weak)) __HOSTJIT_EXPORT
 #    endif
 
 #    if defined(_MSC_VER)
@@ -485,7 +488,6 @@ extern "C"
     __hostjit_max_atexit = 1
   };
 
-  // Exported so hostjit's DynamicLibrary::unload() can find and replay them.
   __HOSTJIT_TABLE_ATTR __hostjit_atexit_fn hostjit_module_atexit_funcs[__hostjit_max_atexit] = {0};
   __HOSTJIT_TABLE_ATTR int hostjit_module_atexit_count                                       = 0;
 
@@ -504,12 +506,14 @@ extern "C"
     return 0;
   }
 
-  // Drains the table, in reverse registration order like a real atexit chain.
-  // Draining is what makes it one-shot: a second call finds the table empty and
-  // does nothing, so the fatbin is never unregistered twice (which would be a
-  // use-after-free -- __cudaUnregisterFatBinary destroys the module rather than
-  // dropping a reference).
-  __HOSTJIT_ATEXIT_ATTR void hostjit_run_module_atexit(void)
+  // Tears the module down: runs the captured destructors in reverse registration
+  // order, like a real atexit chain, which is what unregisters the fatbin. The OS
+  // hooks below call it, and it is the only symbol the image exports for a loader
+  // that wants to do it earlier. Draining is what makes it one-shot: a second call
+  // finds the table empty and does nothing, so the fatbin is never unregistered
+  // twice (which would be a use-after-free -- __cudaUnregisterFatBinary destroys
+  // the module rather than dropping a reference).
+  __HOSTJIT_FINI_ATTR void __cudacc_module_fini(void)
   {
     while (hostjit_module_atexit_count > 0)
     {
@@ -528,7 +532,7 @@ extern "C"
   // an entry; the ones that run after the first find the table already drained.
   __attribute__((used, retain, section(".fini_array"),
                  aligned(__alignof__(__hostjit_atexit_fn)))) static __hostjit_atexit_fn __hostjit_module_fini_entry =
-    hostjit_run_module_atexit;
+    __cudacc_module_fini;
 #    else
   // Windows has no equivalent of .fini_array: what the OS runs on load and on
   // unload is the DLL's entry point, and a DLL built without a C runtime has
@@ -570,7 +574,7 @@ extern "C"
     // runtime may already be torn down, so leave it alone.
     else if (reason == __hostjit_process_detach && reserved == 0)
     {
-      hostjit_run_module_atexit();
+      __cudacc_module_fini();
     }
     return 1; // a zero return from the entry point fails LoadLibrary
   }
@@ -582,6 +586,7 @@ extern "C"
 #    undef __HOSTJIT_EXPORT
 #    undef __HOSTJIT_TABLE_ATTR
 #    undef __HOSTJIT_ATEXIT_ATTR
+#    undef __HOSTJIT_FINI_ATTR
 #  endif
 
 #endif // __CUDA__ && __clang__
